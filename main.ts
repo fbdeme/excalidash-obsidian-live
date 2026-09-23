@@ -312,7 +312,14 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 };
             }
 
-            if (!localChanged && !collectionChanged) {
+            // 원격에만 살아 있는 요소(= 로컬에서 지웠는데 서버가 들고 있는 것). 로컬이 그대로여도
+            // 이게 남아 있으면 스킵하면 안 된다 — 안 그러면 유령을 치울 기회가 영영 없다.
+            const localLiveIds = liveIdsOf(parsed.scene.elements ?? []);
+            const remoteGhosts = [...liveIdsOf(remote.elements ?? [])].filter(
+                (id) => !localLiveIds.has(id),
+            );
+
+            if (!localChanged && !collectionChanged && remoteGhosts.length === 0) {
                 return {
                     path: file.path,
                     status: "skipped",
@@ -330,34 +337,38 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 collectionId,
             );
 
-            // 올린 뒤 대조한다. 살아 있는 id 집합이 어긋나면 조용히 넘기지 않는다.
-            const liveIdsOf = (list: readonly unknown[]): Set<string> =>
-                new Set(
-                    list
-                        .filter((element) => isLiveElement(element))
-                        .map((element) => elementId(element))
-                        .filter((id): id is string => id !== null),
-                );
-            const expectedLive = liveIdsOf(outgoing.elements ?? []);
-            const actualLive = liveIdsOf(updated.elements ?? []);
-            const ghosts = [...actualLive].filter((id) => !expectedLive.has(id));
-            if (ghosts.length > 0) {
-                return {
-                    path: file.path,
-                    status: "error",
-                    message: `Remote kept ${ghosts.length} element(s) that are gone locally (first: ${ghosts[0]}).`,
-                };
-            }
+            // 기록을 먼저 남긴다. 검증에서 걸리더라도 서버는 이미 올라갔으므로, 여기서 빠져나가면
+            // 다음 저장이 같은 걸 또 밀어 올린다(실측: version 이 11 -> 30 까지 헛돌았다).
             await this.updateSyncFrontmatter(
                 file,
                 updated.id,
                 updated.version,
                 localHash,
             );
+
+            // 검증은 PUT 응답이 아니라 **다시 읽어서** 한다. 응답은 병합 전 상태를 담고 있어
+            // 멀쩡한 결과를 유령으로 오판한다(실측). 지울 게 있었을 때만 확인한다.
+            if (remoteGhosts.length > 0) {
+                const after = await getRemoteDrawing(target, updated.id);
+                const stillLive = liveIdsOf(after.elements ?? []);
+                const leftover = [...stillLive].filter((id) => !localLiveIds.has(id));
+                if (leftover.length > 0) {
+                    return {
+                        path: file.path,
+                        status: "error",
+                        message: `Remote kept ${leftover.length} deleted element(s) (first: ${leftover[0]}).`,
+                    };
+                }
+            }
+
             return {
                 path: file.path,
                 status: "synced",
-                message: `Updated remote drawing to version ${updated.version}.`,
+                message: `Updated remote drawing to version ${updated.version}${
+                    remoteGhosts.length > 0
+                        ? ` (removed ${remoteGhosts.length} deleted element(s))`
+                        : ""
+                }.`,
             };
         } catch (error) {
             const message =
@@ -1826,6 +1837,15 @@ function elementId(element: unknown): string | null {
 
 function isLiveElement(element: unknown): boolean {
     return isRecord(element) && element.isDeleted !== true;
+}
+
+function liveIdsOf(list: readonly unknown[]): Set<string> {
+    return new Set(
+        list
+            .filter((element) => isLiveElement(element))
+            .map((element) => elementId(element))
+            .filter((id): id is string => id !== null),
+    );
 }
 
 function withTombstones(
