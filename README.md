@@ -1,4 +1,42 @@
-# ExcaliDash sync
+# ExcaliDash Live
+
+> **This is a fork.** It builds on [`siredvin/excalidash-obsidian-sync`](https://github.com/siredvin/excalidash-obsidian-sync)
+> (MIT, © 2026 SirEdvin), which already provides the ExcaliDash REST client, authentication,
+> frontmatter contract, scene parsing and collection resolution. **All of that is theirs.**
+> This fork stays MIT and keeps the original `LICENSE` unchanged.
+>
+> **What this fork adds:** real-time sync over ExcaliDash's socket.io channel, element-level
+> conflict resolution with permanent tombstones, and live updates of an already-open Excalidraw
+> view via `ExcalidrawAutomate`. Upstream is deliberately manual-command-driven and states that
+> its bidirectional conflict handling is limited — that gap is the whole point of this fork.
+>
+> Upstream fixes that are not about real-time are kept on separate branches so they can go back
+> as pull requests.
+
+## Status
+
+Early. The feasibility probes pass (see `docs/current_status.md`), the plumbing is not written yet.
+
+```bash
+node scripts/probe-socket.mjs    --base http://127.0.0.1:6768 --env <instance>/.env
+node scripts/probe-roundtrip.mjs --base http://127.0.0.1:6768 --env <instance>/.env
+```
+
+Measured against a live ExcaliDash instance:
+
+| Question | Answer |
+|---|---|
+| Can a non-browser client join a drawing room? | **Yes — with a login JWT only.** Anonymous and API-key handshakes are denied (the handshake runs `jwt.verify`, and an API key is not a JWT) |
+| Where does the token go? | `handshake.auth.token` **or** `Cookie: excalidash-access-token=…` — both work |
+| Does `element-update` propagate? | **Yes** — but the payload **must** carry `drawingId`, or the server drops it silently |
+| Does the socket persist anything? | **No.** It relays only (`socket.to(roomId).emit(...)`); persistence is REST |
+
+That last row is why this plugin uses two channels: **REST for storage, socket for notification and
+propagation.** Excalidraw's reconciliation is never reimplemented.
+
+---
+
+## Upstream documentation
 
 ![vibe-coded](https://img.shields.io/badge/Hermes%20Agent-Completely%20vibe%20coded%20%F0%9F%98%8E-FFD700?style=for-the-badge&labelColor=07070d)
 

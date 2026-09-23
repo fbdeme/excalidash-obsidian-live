@@ -8,7 +8,8 @@
   "dependencies": {
     "@codemirror/state": "6.5.0",
     "@codemirror/view": "^6.38.1",
-    "lz-string": "^1.5.0"
+    "lz-string": "^1.5.0",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",

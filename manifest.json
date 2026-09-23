@@ -1,10 +1,10 @@
 {
-	"id": "excalidash-sync",
-	"name": "ExcaliDash sync",
+	"id": "excalidash-live",
+	"name": "ExcaliDash Live",
 	"version": "0.2.0",
 	"minAppVersion": "1.13.0",
-	"description": "Sync Excalidraw drawings from vault frontmatter into ExcaliDash.",
-	"author": "SirEdvin",
-	"authorUrl": "https://github.com/SirEdvin",
+	"description": "Real-time two-way sync between Obsidian Excalidraw drawings and ExcaliDash.",
+	"author": "fbdeme (fork of SirEdvin's ExcaliDash sync)",
+	"authorUrl": "https://github.com/fbdeme/excalidash-obsidian-live",
 	"isDesktopOnly": false
 }
