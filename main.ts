@@ -15,6 +15,9 @@ import {
 } from "obsidian";
 import { compressToBase64, decompressFromBase64 } from "lz-string";
 
+// Excalidraw 는 그리는 동안 파일을 계속 저장한다. 이 정도는 기다려야 획 하나마다 서버로 쏘지 않는다.
+const AUTO_SYNC_DEBOUNCE_MS = 2500;
+
 const DEFAULT_API_PATH_PREFIX = "/api";
 const DEFAULT_CSRF_ENDPOINT = "/csrf-token";
 const DEFAULT_CSRF_HEADER = "x-csrf-token";
@@ -92,9 +95,22 @@ const DEFAULT_SETTINGS: ExcaliDashSyncSettings = {
 
 export default class ExcaliDashSyncPlugin extends Plugin {
     settings: ExcaliDashSyncSettings = DEFAULT_SETTINGS;
+    private autoSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    private autoSyncRunning = new Set<string>();
 
     async onload(): Promise<void> {
         await this.loadSettings();
+
+        // 저장할 때마다 자동으로 올린다. opt-in 된 파일만 건드리므로 별도 설정을 두지 않는다.
+        // 되쓰기 루프는 구조적으로 생기지 않는다: syncFile 은 씬 해시가 그대로면 skipped 로 빠져
+        // frontmatter 를 아예 쓰지 않는다.
+        this.registerEvent(
+            this.app.vault.on("modify", (file) => {
+                if (file instanceof TFile) {
+                    this.queueAutoSync(file);
+                }
+            }),
+        );
 
         this.addCommand({
             id: "perform-sync",
@@ -140,6 +156,51 @@ export default class ExcaliDashSyncPlugin extends Plugin {
 
     async saveSettings(): Promise<void> {
         await this.saveData(this.settings);
+    }
+
+    onunload(): void {
+        for (const timer of this.autoSyncTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.autoSyncTimers.clear();
+    }
+
+    queueAutoSync(file: TFile): void {
+        if (!isExcalidrawFile(file)) {
+            return;
+        }
+        debounceByKey(this.autoSyncTimers, file.path, AUTO_SYNC_DEBOUNCE_MS, () => {
+            void this.autoSyncFile(file);
+        });
+    }
+
+    /** 자동 경로. 손으로 부른 게 아니므로 조용히 지나가고, 실패했을 때만 알린다. */
+    async autoSyncFile(file: TFile): Promise<void> {
+        if (this.autoSyncRunning.has(file.path)) {
+            return;
+        }
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        const frontmatter = parseDrawingFrontmatter(cache?.frontmatter);
+        if (frontmatter.destination === undefined) {
+            return;
+        }
+        const target = this.settings.targets.find(
+            (item) => item.name === frontmatter.destination,
+        );
+        if (target === undefined) {
+            return;
+        }
+
+        this.autoSyncRunning.add(file.path);
+        try {
+            const result = await this.syncFile(file, target, frontmatter);
+            if (result.status === "error" || result.status === "conflict") {
+                new Notice(`ExcaliDash Live: ${file.basename} — ${result.message}`);
+            }
+        } finally {
+            this.autoSyncRunning.delete(file.path);
+        }
     }
 
     async performSync(): Promise<void> {
@@ -1707,6 +1768,26 @@ function readNonEmptyString(value: unknown): string | undefined {
     return typeof value === "string" && value.trim().length > 0
         ? value.trim()
         : undefined;
+}
+
+/** 같은 key 로 연달아 들어오면 마지막 것만 남긴다. */
+function debounceByKey(
+    timers: Map<string, ReturnType<typeof setTimeout>>,
+    key: string,
+    delayMs: number,
+    run: () => void,
+): void {
+    const existing = timers.get(key);
+    if (existing !== undefined) {
+        clearTimeout(existing);
+    }
+    timers.set(
+        key,
+        setTimeout(() => {
+            timers.delete(key);
+            run();
+        }, delayMs),
+    );
 }
 
 function isExcalidrawFile(file: TFile): boolean {

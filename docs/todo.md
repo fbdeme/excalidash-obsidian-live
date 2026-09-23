@@ -8,13 +8,21 @@
 - [ ] 모바일(아이패드) Obsidian 에서 socket.io 연결이 되는가 — 주 편집 기기라 필수
 - [ ] upstream 플러그인이 vault 에 깔린 상태에서 `ExcalidrawAutomate` 접근이 되는가 (`ea.setView`)
 
+## 1b. 저장 시 자동 동기화 (A)
+
+- [x] `vault.on("modify")` → 디바운스 → opt-in 된 파일만 동기화 (2026-09-23)
+- [x] 되쓰기 루프 방지 — 억제 장치 없이 구조로 막힘(씬 해시 같으면 `skipped`, frontmatter 안 씀)
+- [x] 검사 `scripts/verify-auto-sync-debounce.mjs` (되돌리면 exit 1 실측)
+- [ ] 실제 기기에서 그려 보며 2.5 초 디바운스가 적당한지 확인
+
 ## 2. 실시간 배관
 
 - [ ] socket.io-client 번들 (esbuild, 크기 확인)
 - [ ] access 토큰 15분 만료 갱신 (Issue #5)
 - [ ] 방 참가·재참가 상태 기계 — 파일 닫았다 열기·네트워크 끊김 복구
 - [ ] 원격 `element-update` → 열린 뷰면 `ea.addElementsToView()`, 아니면 파일에 기록
-- [ ] 로컬 변경 → 방에 `element-update` 전파 (디바운스)
+- [ ] 로컬 변경 → 방에 `element-update` 전파 (A 의 디바운스 재사용)
+- [ ] **접속·재접속 시 한 번 대조** — socket 이벤트는 재방송되지 않으므로, 꺼져 있던/끊겼던 동안의 변경은 이걸로만 메운다. 주기 폴링 대신 이걸 쓴다(토큰 15 분 만료로 재접속이 잦아 자연히 자주 돈다)
 
 ## 3. 충돌 해소 (CLAUDE.md §충돌 규칙 그대로)
 
