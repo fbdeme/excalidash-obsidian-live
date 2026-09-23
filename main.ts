@@ -320,14 +320,34 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 };
             }
 
+            const outgoing = withTombstones(parsed.scene, remote.elements ?? []);
             const updated = await updateRemoteDrawing(
                 target,
                 frontmatter.id,
                 file.basename,
-                parsed.scene,
+                outgoing,
                 remote.version,
                 collectionId,
             );
+
+            // 올린 뒤 대조한다. 살아 있는 id 집합이 어긋나면 조용히 넘기지 않는다.
+            const liveIdsOf = (list: readonly unknown[]): Set<string> =>
+                new Set(
+                    list
+                        .filter((element) => isLiveElement(element))
+                        .map((element) => elementId(element))
+                        .filter((id): id is string => id !== null),
+                );
+            const expectedLive = liveIdsOf(outgoing.elements ?? []);
+            const actualLive = liveIdsOf(updated.elements ?? []);
+            const ghosts = [...actualLive].filter((id) => !expectedLive.has(id));
+            if (ghosts.length > 0) {
+                return {
+                    path: file.path,
+                    status: "error",
+                    message: `Remote kept ${ghosts.length} element(s) that are gone locally (first: ${ghosts[0]}).`,
+                };
+            }
             await this.updateSyncFrontmatter(
                 file,
                 updated.id,
@@ -1788,6 +1808,54 @@ function debounceByKey(
             run();
         }, delayMs),
     );
+}
+
+/**
+ * 새 씬에 없는 원격 요소를 isDeleted 로 되돌려 보낸다.
+ *
+ * ExcaliDash 는 요소 단위로 병합한다(같은 id 는 version 큰 쪽이 이긴다). 그래서 지운 요소를
+ * 그냥 빼고 PUT 하면 서버가 자기 사본을 그대로 들고 있어 **삭제가 반영되지 않는다**. Excalidraw
+ * 플러그인은 지운 요소를 씬에서 아예 빼버리므로 로컬에는 tombstone 이 없다 — 여기서 만들어야 한다.
+ *
+ * 이미 죽은 id 도 매번 다시 싣는다(영구 tombstone). 떨어뜨리면 그 사이 열려 있던 편집기가
+ * 다음 저장에서 서버와 병합하며 옛 요소를 되살린다.
+ */
+function elementId(element: unknown): string | null {
+    return isRecord(element) && typeof element.id === "string" ? element.id : null;
+}
+
+function isLiveElement(element: unknown): boolean {
+    return isRecord(element) && element.isDeleted !== true;
+}
+
+function withTombstones(
+    scene: ExcalidrawScene,
+    remoteElements: readonly unknown[],
+): ExcalidrawScene {
+    const elements = Array.isArray(scene.elements) ? scene.elements : [];
+    const liveIds = new Set(
+        elements
+            .filter((element) => isLiveElement(element))
+            .map((element) => elementId(element))
+            .filter((id): id is string => id !== null),
+    );
+    const stamp = Date.now();
+    const tombstones = remoteElements
+        .filter((element) => {
+            const id = elementId(element);
+            return id !== null && !liveIds.has(id);
+        })
+        .map((element) => ({
+            ...(element as Record<string, unknown>),
+            isDeleted: true,
+            version: Math.max(
+                Number((element as Record<string, unknown>).version ?? 0) + 1,
+                stamp,
+            ),
+            versionNonce: stamp,
+        }));
+
+    return { ...scene, elements: [...elements, ...tombstones] };
 }
 
 function isExcalidrawFile(file: TFile): boolean {
