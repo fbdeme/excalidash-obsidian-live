@@ -145,14 +145,14 @@ export default class ExcaliDashSyncPlugin extends Plugin {
     async performSync(): Promise<void> {
         const file = this.app.workspace.getActiveFile();
         if (file === null || !isExcalidrawFile(file)) {
-            new Notice("ExcaliDash sync: open an Excalidraw drawing to sync.");
+            new Notice("ExcaliDash Live: open an Excalidraw drawing to sync.");
             return;
         }
 
         const cache = this.app.metadataCache.getFileCache(file);
         const frontmatter = parseDrawingFrontmatter(cache?.frontmatter);
         if (frontmatter.destination === undefined) {
-            new Notice("ExcaliDash sync: current drawing is not opted in.");
+            new Notice("ExcaliDash Live: current drawing is not opted in.");
             return;
         }
 
@@ -324,7 +324,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
 
     showSyncSummary(results: SyncResult[]): void {
         if (results.length === 0) {
-            new Notice("ExcaliDash sync: no opted-in drawings found.");
+            new Notice("ExcaliDash Live: no opted-in drawings found.");
             return;
         }
 
@@ -340,7 +340,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         const details = [...conflicts, ...errors]
             .map((item) => `${item.path}: ${item.message}`)
             .join("\n");
-        const summary = `ExcaliDash sync: ${synced} synced, ${skipped} skipped, ${conflicts.length} conflicts, ${errors.length} errors.`;
+        const summary = `ExcaliDash Live: ${synced} synced, ${skipped} skipped, ${conflicts.length} conflicts, ${errors.length} errors.`;
         new Notice(
             details.length > 0 ? `${summary}\n${details}` : summary,
             details.length > 0 ? 12000 : 5000,
@@ -369,7 +369,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             }
         }
 
-        const summary = `ExcaliDash sync: updated ${updated} drawings in ${folder.path}. ${errors.length} errors.`;
+        const summary = `ExcaliDash Live: updated ${updated} drawings in ${folder.path}. ${errors.length} errors.`;
         new Notice(
             errors.length > 0 ? `${summary}\n${errors.join("\n")}` : summary,
             errors.length > 0 ? 12000 : 5000,
@@ -836,7 +836,7 @@ class FolderDrawingSettingsModal extends Modal {
                         const folder = this.getFolder();
                         if (folder === null) {
                             new Notice(
-                                "ExcaliDash sync: choose an existing folder.",
+                                "ExcaliDash Live: choose an existing folder.",
                             );
                             return;
                         }
