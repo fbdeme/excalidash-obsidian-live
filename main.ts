@@ -18,6 +18,16 @@ import { compressToBase64, decompressFromBase64 } from "lz-string";
 // Excalidraw 는 그리는 동안 파일을 계속 저장한다. 이 정도는 기다려야 획 하나마다 서버로 쏘지 않는다.
 const AUTO_SYNC_DEBOUNCE_MS = 2500;
 
+/**
+ * 저장 시 자동 동기화.
+ *
+ * 2026-09-23 에 이걸 의심해 껐다가 되돌렸다. 도면이 깨지는 건 우리 탓이 아니었다 —
+ * 아무것도 하지 않는 656 바이트짜리 no-op 플러그인으로도 재현됐고, **새로 만든 도면은 멀쩡했다.**
+ * 원인은 파일에 이미 박힌 오염(`## Text Elements` 중복)이고, 그런 파일은 열고 저장할 때마다
+ * 유령 요소를 스스로 재생산한다. 자세한 건 docs/issues.md Issue #8.
+ */
+const AUTO_SYNC_ON_SAVE = true;
+
 const DEFAULT_API_PATH_PREFIX = "/api";
 const DEFAULT_CSRF_ENDPOINT = "/csrf-token";
 const DEFAULT_CSRF_HEADER = "x-csrf-token";
@@ -132,19 +142,37 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             }),
         );
 
-        this.registerEvent(
-            this.app.vault.on("modify", (file) => {
-                if (file instanceof TFile) {
-                    this.queueAutoSync(file);
-                }
-            }),
-        );
+        if (AUTO_SYNC_ON_SAVE) {
+            this.registerEvent(
+                this.app.vault.on("modify", (file) => {
+                    if (file instanceof TFile) {
+                        this.queueAutoSync(file);
+                    }
+                }),
+            );
+        }
 
         this.addCommand({
             id: "perform-sync",
             name: "Sync current drawing",
             callback: () => {
                 void this.performSync();
+            },
+        });
+
+        this.addCommand({
+            id: "pull-current-drawing",
+            name: "Pull current drawing from ExcaliDash",
+            callback: () => {
+                void this.pullCurrentDrawing();
+            },
+        });
+
+        this.addCommand({
+            id: "sync-stencil-library",
+            name: "Sync stencil library with ExcaliDash",
+            callback: () => {
+                void this.syncStencilLibrary();
             },
         });
 
@@ -260,6 +288,163 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         }
 
         this.showSyncSummary([await this.syncFile(file, target, frontmatter)]);
+    }
+
+    /** 이 파일이 지금 Excalidraw 뷰로 열려 있나. 열려 있으면 파일을 쓰면 안 된다(2026-09-23 사고). */
+    isOpenInExcalidrawView(file: TFile): boolean {
+        return this.app.workspace
+            .getLeavesOfType("excalidraw")
+            .some((leaf) => {
+                const state = leaf.getViewState().state as
+                    | { file?: unknown }
+                    | undefined;
+                return state?.file === file.path;
+            });
+    }
+
+    async pullCurrentDrawing(): Promise<void> {
+        const file = this.app.workspace.getActiveFile();
+        if (file === null || !isExcalidrawFile(file)) {
+            new Notice("ExcaliDash Live: open an Excalidraw drawing to pull.");
+            return;
+        }
+        const raw0 = this.app.metadataCache.getFileCache(file);
+        const frontmatter = this.resolveDrawingState(
+            file,
+            parseDrawingFrontmatter(raw0?.frontmatter),
+        );
+        const target = this.settings.targets.find(
+            (item) => item.name === frontmatter.destination,
+        );
+        if (frontmatter.destination === undefined || target === undefined) {
+            new Notice("ExcaliDash Live: current drawing is not opted in.");
+            return;
+        }
+        if (frontmatter.id === undefined) {
+            new Notice("ExcaliDash Live: no remote drawing recorded yet — push once first.");
+            return;
+        }
+        // v1 은 열려 있으면 거부한다. 열린 뷰에 직접 주입(ExcalidrawAutomate)은 다음 단계.
+        if (this.isOpenInExcalidrawView(file)) {
+            new Notice("ExcaliDash Live: close the drawing first, then pull.");
+            return;
+        }
+
+        this.showSyncSummary([await this.pullFile(file, target, frontmatter)]);
+    }
+
+    async pullFile(
+        file: TFile,
+        target: ExcaliDashTarget,
+        frontmatter: DrawingFrontmatter,
+    ): Promise<SyncResult> {
+        try {
+            const raw = await this.app.vault.read(file);
+            const parsed = parseExcalidrawScene(raw, file.extension === "md");
+            if (parsed === null) {
+                return { path: file.path, status: "error", message: "Unable to parse Excalidraw scene." };
+            }
+            const remote = await getRemoteDrawing(target, frontmatter.id as string);
+            const { scene, changed } = mergeScenes(parsed.scene, remote.elements ?? []);
+            if (changed === 0) {
+                await this.recordSync(file, remote.id, remote.version, await sceneHash(parsed.scene));
+                return { path: file.path, status: "skipped", message: "Already up to date." };
+            }
+            await this.writeRemoteSceneToLocal(file, raw, parsed, scene);
+            await this.recordSync(file, remote.id, remote.version, await sceneHash(scene));
+            return {
+                path: file.path,
+                status: "synced",
+                message: `Pulled ${changed} element(s) from ExcaliDash (version ${remote.version}).`,
+            };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { path: file.path, status: "error", message };
+        }
+    }
+
+    /** ExcaliDash 의 스텐실 라이브러리와 Obsidian 의 라이브러리를 합친다. 양쪽 다 갱신한다. */
+    async syncStencilLibrary(): Promise<void> {
+        const target = this.settings.targets[0];
+        if (target === undefined) {
+            new Notice("ExcaliDash Live: configure a target first.");
+            return;
+        }
+        try {
+            const session = await loginWithPassword(target);
+            const remote = await requestUrl({
+                url: buildApiUrl(target, "/library"),
+                method: "GET",
+                headers: { Accept: "application/json", Cookie: session.cookieHeader },
+                throw: false,
+            });
+            const remoteItems: unknown[] = Array.isArray(remote.json?.items) ? remote.json.items : [];
+
+            const path = excalidrawLibraryPath(this.app);
+            const localItems = await this.readStencilLibrary(path);
+
+            const merged = mergeLibraryItems(localItems, remoteItems);
+            await this.writeStencilLibrary(path, merged);
+
+            const csrf = await getCsrfToken(target, session.cookieHeader);
+            const put = await requestUrl({
+                url: buildApiUrl(target, "/library"),
+                method: "PUT",
+                headers: {
+                    Accept: "application/json",
+                    "Content-Type": "application/json",
+                    Cookie: csrf.cookieHeader.length > 0 ? csrf.cookieHeader : session.cookieHeader,
+                    [DEFAULT_CSRF_HEADER]: csrf.token,
+                },
+                body: JSON.stringify({ items: merged }),
+                throw: false,
+            });
+            if (put.status >= 400) {
+                new Notice(`ExcaliDash Live: library push failed (${put.status}).`);
+                return;
+            }
+            new Notice(`ExcaliDash Live: stencil library synced (${merged.length} items).`);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            new Notice(`ExcaliDash Live: library sync failed — ${message}`);
+        }
+    }
+
+    /** Excalidraw 의 라이브러리 파일을 읽는다. 없거나 깨졌으면 빈 목록 — 여기서 죽으면 동기화 전체가 막힌다. */
+    async readStencilLibrary(path: string): Promise<unknown[]> {
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (!(existing instanceof TFile)) {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(await this.app.vault.read(existing)) as {
+                libraryItems?: unknown;
+                library?: unknown;
+            };
+            if (Array.isArray(parsed.libraryItems)) return parsed.libraryItems;
+            if (Array.isArray(parsed.library)) return parsed.library;   // 옛 형식
+            return [];
+        } catch {
+            return [];
+        }
+    }
+
+    async writeStencilLibrary(path: string, items: unknown[]): Promise<void> {
+        const body = JSON.stringify(
+            { type: "excalidrawlib", version: 2, source: "excalidash-live", libraryItems: items },
+            null,
+            2,
+        );
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) {
+            await this.app.vault.process(existing, () => body);
+            return;
+        }
+        const folder = path.slice(0, path.lastIndexOf("/"));
+        if (folder.length > 0 && this.app.vault.getAbstractFileByPath(folder) === null) {
+            await this.app.vault.createFolder(folder);
+        }
+        await this.app.vault.create(path, body);
     }
 
     async syncFile(
@@ -1891,6 +2076,41 @@ function isLiveElement(element: unknown): boolean {
     return isRecord(element) && element.isDeleted !== true;
 }
 
+/**
+ * 원격 씬을 로컬 씬에 합친다. **요소 단위로 version 큰 쪽이 이긴다** — Excalidraw 자체의 reconcile 과
+ * 같은 규칙이라 공통 조상이 필요 없고, 그래서 여러 사람이 동시에 고쳐도 성립한다.
+ * 삭제는 tombstone(`isDeleted`)이 그냥 하나의 상태로 참여한다.
+ */
+function mergeScenes(
+    local: ExcalidrawScene,
+    remoteElements: readonly unknown[],
+): { scene: ExcalidrawScene; changed: number } {
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const element of local.elements ?? []) {
+        const id = elementId(element);
+        if (id !== null) byId.set(id, element as Record<string, unknown>);
+    }
+
+    let changed = 0;
+    for (const element of remoteElements) {
+        const id = elementId(element);
+        if (id === null) continue;
+        const mine = byId.get(id);
+        const theirs = element as Record<string, unknown>;
+        if (mine === undefined) {
+            byId.set(id, theirs);
+            changed++;
+            continue;
+        }
+        if (Number(theirs.version ?? 0) > Number(mine.version ?? 0)) {
+            byId.set(id, theirs);
+            changed++;
+        }
+    }
+
+    return { scene: { ...local, elements: [...byId.values()] }, changed };
+}
+
 function liveIdsOf(list: readonly unknown[]): Set<string> {
     return new Set(
         list
@@ -1928,6 +2148,45 @@ function withTombstones(
         }));
 
     return { ...scene, elements: [...elements, ...tombstones] };
+}
+
+/** 라이브러리 항목을 id 로 합친다. 같은 id 면 created 가 큰 쪽(더 최근에 만든 것)을 남긴다. */
+function mergeLibraryItems(
+    local: readonly unknown[],
+    remote: readonly unknown[],
+): unknown[] {
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const item of [...local, ...remote]) {
+        if (!isRecord(item)) continue;
+        const id = typeof item.id === "string" ? item.id : null;
+        if (id === null) continue;
+        const current = byId.get(id);
+        if (
+            current === undefined ||
+            Number(item.created ?? 0) > Number(current.created ?? 0)
+        ) {
+            byId.set(id, item);
+        }
+    }
+    return [...byId.values()];
+}
+
+/** Excalidraw 플러그인이 쓰는 스텐실 라이브러리 파일 경로. 설정을 읽고, 없으면 기본값. */
+function excalidrawLibraryPath(app: App): string {
+    const settings = (
+        app as unknown as {
+            plugins?: { plugins?: Record<string, { settings?: Record<string, unknown> }> };
+        }
+    ).plugins?.plugins?.["obsidian-excalidraw-plugin"]?.settings;
+    const folder =
+        typeof settings?.libraryFolderPath === "string" && settings.libraryFolderPath.length > 0
+            ? settings.libraryFolderPath
+            : "Excalidraw/Libraries";
+    const name =
+        typeof settings?.libraryFileName === "string" && settings.libraryFileName.length > 0
+            ? settings.libraryFileName
+            : "local-library";
+    return `${folder}/${name}.excalidrawlib`;
 }
 
 function isExcalidrawFile(file: TFile): boolean {

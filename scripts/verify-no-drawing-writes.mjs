@@ -53,7 +53,15 @@ if (!/saveSettings\(\)/.test(record)) {
 }
 
 // ③ 남아 있는 쓰기는 **사용자가 직접 부른 것**뿐이어야 한다
-const ALLOWED = new Set(["writeRemoteSceneToLocal", "applyDrawingSettingsToFolder", "save"]);
+// writeRemoteSceneToLocal = pull 이 도면을 쓰는 유일한 자리. **열린 뷰에서는 호출되면 안 된다** — ④ 에서 확인.
+// writeStencilLibrary = 스텐실 라이브러리 파일(.excalidrawlib). 도면이 아니고 Excalidraw 가 편집 중이지도 않다.
+// 나머지는 사용자가 직접 부르는 명령·모달.
+const ALLOWED = new Set([
+    "writeRemoteSceneToLocal",
+    "writeStencilLibrary",
+    "applyDrawingSettingsToFolder",
+    "save",
+]);
 const enclosing = (idx) => {
     for (let i = idx; i >= 0; i--) {
         const m = /^\s{4}(?:async )?([a-zA-Z]+)\(/.exec(lines[i]);
@@ -69,7 +77,19 @@ for (let i = 0; i < lines.length; i++) {
     }
 }
 
-// ④ 검사가 발화하는지 — 사고 당시의 호출을 넣어보면 ①에 걸려야 한다
+// ④ pull 은 도면이 열려 있으면 파일을 쓰면 안 된다 — 그 관문이 실제로 있는가
+{
+    const gate = methodBody("pullCurrentDrawing").map(([, t]) => t).join("\n");
+    if (!/isOpenInExcalidrawView\(/.test(gate)) {
+        fail.push("pullCurrentDrawing 에 열린-뷰 관문이 없다 — 열린 도면을 덮어쓰면 2026-09-23 사고가 재현된다");
+    }
+    const guard = methodBody("isOpenInExcalidrawView").map(([, t]) => t).join("\n");
+    if (!/getLeavesOfType\("excalidraw"\)/.test(guard)) {
+        fail.push("isOpenInExcalidrawView 가 Excalidraw 뷰를 실제로 보지 않는다");
+    }
+}
+
+// ⑤ 검사가 발화하는지 — 사고 당시의 호출을 넣어보면 ①에 걸려야 한다
 {
     const injected = ["    async recordSync(", "        await this.app.fileManager.processFrontMatter(file, () => {});", "    }"].join("\n");
     if (!WRITE_API.test(injected)) {
