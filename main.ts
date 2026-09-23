@@ -41,8 +41,24 @@ interface TemporarySession {
     cookieHeader: string;
 }
 
+interface SyncState {
+    id: string;
+    version: number;
+    lastHash: string;
+    lastSynced: string;
+}
+
 interface ExcaliDashSyncSettings {
     targets: ExcaliDashTarget[];
+    /**
+     * 파일 경로 -> 마지막 동기화 기록. **도면 파일에 쓰지 않기 위해** 여기 둔다.
+     *
+     * upstream 은 이걸 frontmatter 에 되썼는데, Excalidraw 플러그인이 그 파일을 열어둔 채
+     * 자기 형식(`## Text Elements` + 압축 씬)으로 저장하는 중이라 서로 밟는다. 실측(2026-09-23):
+     * 빈 텍스트 박스를 만들고 저장하면 Text Elements 구간이 통째로 그 요소 안으로 빨려 들어갔고,
+     * 플러그인을 끄면 재현되지 않았다.
+     */
+    syncState: Record<string, SyncState>;
 }
 
 type PersistedExcaliDashTarget = Partial<ExcaliDashTarget> & {
@@ -91,6 +107,7 @@ interface ConnectionTestResult {
 
 const DEFAULT_SETTINGS: ExcaliDashSyncSettings = {
     targets: [],
+    syncState: {},
 };
 
 export default class ExcaliDashSyncPlugin extends Plugin {
@@ -104,6 +121,17 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         // 저장할 때마다 자동으로 올린다. opt-in 된 파일만 건드리므로 별도 설정을 두지 않는다.
         // 되쓰기 루프는 구조적으로 생기지 않는다: syncFile 은 씬 해시가 그대로면 skipped 로 빠져
         // frontmatter 를 아예 쓰지 않는다.
+        this.registerEvent(
+            this.app.vault.on("rename", (file, oldPath) => {
+                const state = this.settings.syncState[oldPath];
+                if (state !== undefined) {
+                    delete this.settings.syncState[oldPath];
+                    this.settings.syncState[file.path] = state;
+                    void this.saveSettings();
+                }
+            }),
+        );
+
         this.registerEvent(
             this.app.vault.on("modify", (file) => {
                 if (file instanceof TFile) {
@@ -237,8 +265,9 @@ export default class ExcaliDashSyncPlugin extends Plugin {
     async syncFile(
         file: TFile,
         target: ExcaliDashTarget,
-        frontmatter: DrawingFrontmatter,
+        rawFrontmatter: DrawingFrontmatter,
     ): Promise<SyncResult> {
+        const frontmatter = this.resolveDrawingState(file, rawFrontmatter);
         try {
             const raw = await this.app.vault.read(file);
             const parsed = parseExcalidrawScene(raw, file.extension === "md");
@@ -264,7 +293,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                     parsed.scene,
                     collectionId,
                 );
-                await this.updateSyncFrontmatter(
+                await this.recordSync(
                     file,
                     created.id,
                     created.version,
@@ -291,7 +320,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 !localChanged
             ) {
                 await this.writeRemoteSceneToLocal(file, raw, parsed, remote);
-                await this.updateSyncFrontmatter(
+                await this.recordSync(
                     file,
                     remote.id,
                     remote.version,
@@ -339,7 +368,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
 
             // 기록을 먼저 남긴다. 검증에서 걸리더라도 서버는 이미 올라갔으므로, 여기서 빠져나가면
             // 다음 저장이 같은 걸 또 밀어 올린다(실측: version 이 11 -> 30 까지 헛돌았다).
-            await this.updateSyncFrontmatter(
+            await this.recordSync(
                 file,
                 updated.id,
                 updated.version,
@@ -381,18 +410,41 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         }
     }
 
-    async updateSyncFrontmatter(
+    /**
+     * 동기화 기록을 남긴다. **도면 파일은 건드리지 않는다** — frontmatter 에 되쓰면 Excalidraw
+     * 플러그인의 저장과 부딪혀 파일이 깨진다(설정의 syncState 주석 참조).
+     */
+    async recordSync(
         file: TFile,
         id: string,
         version: number,
         hash: string,
     ): Promise<void> {
-        await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-            frontmatter["excalidash-id"] = id;
-            frontmatter["excalidash-version"] = version;
-            frontmatter["excalidash-last-hash"] = hash;
-            frontmatter["excalidash-last-synced"] = new Date().toISOString();
-        });
+        this.settings.syncState[file.path] = {
+            id,
+            version,
+            lastHash: hash,
+            lastSynced: new Date().toISOString(),
+        };
+        await this.saveSettings();
+    }
+
+    /** frontmatter 의 opt-in 값 + 우리가 보관한 기록을 합친다. 기록이 없으면 옛 frontmatter 를 승계한다. */
+    resolveDrawingState(
+        file: TFile,
+        frontmatter: DrawingFrontmatter,
+    ): DrawingFrontmatter {
+        const state = this.settings.syncState[file.path];
+        if (state === undefined) {
+            return frontmatter;
+        }
+        return {
+            ...frontmatter,
+            id: frontmatter.id ?? state.id,
+            version: state.version,
+            lastHash: state.lastHash,
+            lastSynced: state.lastSynced,
+        };
     }
 
     async writeRemoteSceneToLocal(
@@ -1894,6 +1946,9 @@ function normalizeSettings(
                   normalizeTarget(target as PersistedExcaliDashTarget),
               )
             : [],
+        syncState: isRecord(loaded?.syncState)
+            ? (loaded.syncState as Record<string, SyncState>)
+            : {},
     };
 }
 

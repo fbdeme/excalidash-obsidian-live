@@ -80,3 +80,27 @@ ExcaliDash 백엔드는 `fileId` 가 `^[\w-]{1,200}$` 가 아니면 `delete resu
 
 ### upstream 에 돌려줄 것
 이건 실시간과 무관한 순수 버그 수정이라 **PR 대상**이다. `feat/realtime-collab` 에서 떼어 별도 브랜치로 올릴 것.
+
+---
+
+## Issue #7: 동기화가 도면 파일을 깨뜨렸다 (frontmatter 되쓰기)
+**상태: ✅ 해결됨 (2026-09-23)**
+
+### 증상
+Obsidian 의 Excalidraw 뷰에서 **빈 텍스트 박스를 만들고 저장하면, 그 박스 안에 `## Text Elements` 구간이 통째로 들어갔다** — 블록 참조(`^th`, `^desc:t0`)까지 같이. 그냥 저장만 하면 재현되지 않았다.
+
+실측 피해: `architecture` 의 요소 `tA6Vc5lk` 가 252 자 / 25 줄, `structure` 의 `tabicl:t` 가 "TabICL" 대신 `AI Agent ^agent:t …`. `## Text Elements` 구간에는 같은 항목이 두 벌씩 쌓였다.
+
+### 원인 (사용자 실측으로 확정)
+동기화 직후 `processFrontMatter` 로 `excalidash-id/version/last-hash/last-synced` 를 **도면 파일에 되썼다**(upstream 설계). Excalidraw 플러그인은 같은 파일을 열어둔 채 자기 형식(`## Text Elements` + 압축 씬)으로 저장하는 중이라 서로 밟는다.
+
+**플러그인을 끄고 같은 조작을 하니 재현되지 않았다** — 이걸로 확정. 추측 두 개(서버측 편집 / 자동 동기화)를 놓고 사용자가 한 번의 토글로 갈랐다.
+
+### 해결
+동기화 기록을 **파일 밖**(플러그인 설정 `syncState`, 파일 경로 키)으로 옮겼다. frontmatter 는 이제 **읽기만** 한다 — opt-in 키(`destination`·`sync`·`collection`·선택적 `id`)는 사용자 소유다. 기록이 없으면 옛 frontmatter 값을 승계하므로 기존 파일도 그대로 동작한다. 파일 이름이 바뀌면 기록도 따라간다(안 그러면 드로잉이 하나 더 생긴다).
+
+### 검사
+`scripts/verify-no-drawing-writes.mjs` — `syncFile`·`recordSync`·`autoSyncFile` 등 동기화 경로에 파일 쓰기 API 가 **하나도 없어야** 통과. 남아 있는 쓰기는 사용자가 직접 부르는 자리(`applyDrawingSettingsToFolder`·설정 모달·양방향 pull)뿐임을 확인한다. `recordSync` 에 옛 호출을 되살리면 exit 1 (실측).
+
+### 남은 위험
+**양방향(`bidirectional`) 모드의 `writeRemoteSceneToLocal` 은 여전히 도면 파일을 쓴다.** 지금은 단방향이라 닿지 않지만, 양방향을 켜면 같은 부류의 사고가 난다. 실시간(C) 설계에서 이 경로를 어떻게 다룰지 정해야 한다 — 열린 뷰가 있으면 `ExcalidrawAutomate` 로 넣고 파일은 건드리지 않는 쪽이 맞아 보인다.
