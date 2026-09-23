@@ -1,6 +1,37 @@
 # excalidash-obsidian-live — 현재 상태
 
-> 최종 업데이트: 2026-09-23 (**양방향 동작** — push·pull·라이브러리 공유. 열린 뷰 주입까지. ▶ 다음 = socket.io 실시간)
+> 최종 업데이트: 2026-09-23 (**⛔ 중단 — 도면은 ExcaliDash 에서만 그린다. 이 플러그인은 쓰지 않는다**)
+
+## ⛔ 중단 결정 (2026-09-23, 사용자 선택 B)
+
+**도면은 ExcaliDash 한 곳에서만 그리고 고친다.** Obsidian 에는 도면 사본을 두지 않고 링크 노트만 둔다
+(`vault/Projects/ontic-agent-tabularFM/diagrams/ExcaliDash 도면.md`). Gram 의 플러그인은 꺼져 있다.
+
+### 왜
+실시간을 붙인 날 하루에 사고가 넷 났고, 넷 다 **같은 설계 실수**였다: 플러그인이 "로컬에 없으면 지운 것" 으로
+**삭제를 추론해 만들어 냈고**, 그 tombstone 에 `Date.now()` version 을 붙여 늘 이기게 했다. 로컬 사본(늦은 파일·
+화면·죽은 사본)이 조금이라도 어긋나는 순간이 곧 대량 삭제가 됐다. 증상마다 막은 반창고(knownIds·화면에서 읽기·
+중복 제거)는 추론을 덜 틀리게 할 뿐 없애지 못했다. 게다가 도면 파일이 **LiveSync 와 ExcaliDash 두 경로로**
+동기화돼 되먹임이 생겼다. 원하는 것(나·Claude·다른 사람이 같은 도면을 실시간으로 고친다)은 ExcaliDash 가 이미
+하는 일이라, 그걸 Obsidian 안에 복제하는 것 자체를 그만뒀다. 자세한 건 `docs/issues.md` #9·#10.
+
+### 다시 할 거라면 (원칙)
+1. 삭제는 **편집기만** 만든다(`isDeleted` + 편집기의 version). 없음 ≠ 삭제. `Date.now()` version 금지.
+2. 로컬 출처는 **열린 화면 하나**. 파일 변경 이벤트로 push 하지 않는다.
+3. 도면을 **한 경로로만** 동기화한다(LiveSync 대상에서 뺄 것).
+4. Obsidian Excalidraw 는 `## Text Elements` 를 **정확히 8 자 id** 로만 읽는다(#9).
+
+### 정리된 상태
+| | |
+|---|---|
+| ExcaliDash architecture | v66 · id 당 한 벌(1,246→655) · 라벨 14 개 복구 · 웹 화면 확인 |
+| ExcaliDash structure | 라벨 12 개 · 중복 0 |
+| vault 도면 사본 2 개 | vault 밖 `~/workspace_2026/obsidian-livesync/backup/obsidian-drawings-20260923/` 로 이동(삭제 아님) |
+| Gram 플러그인 | 꺼짐(폴더는 남아 있음) |
+
+---
+
+## (이하 중단 전 기록)
 
 ## ▶ 다음 세션 — 실시간(C) 이어가기 (2026-09-23 compact 핸드오프)
 

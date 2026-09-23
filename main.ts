@@ -809,6 +809,13 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 };
             }
 
+            // 열려 있으면 화면이 정본이다. 파일은 Excalidraw 자동 저장(60 초)만큼 늦어서, 실시간으로 받은
+            // 요소가 파일엔 아직 없다 — 그걸 "지웠다" 로 보고 tombstone 을 쏜 사고가 있었다(2026-09-23 05:25).
+            const view = this.openExcalidrawView(file);
+            if (view !== null) {
+                parsed.scene.elements = view.excalidrawAPI.getSceneElementsIncludingDeleted();
+            }
+
             const localHash = await sceneHash(parsed.scene);
             const localChanged = localHash !== frontmatter.lastHash;
             const collectionId = await resolveDrawingCollectionId(
@@ -2522,7 +2529,10 @@ function mergeScenes(
 }
 
 /**
- * Excalidraw 플러그인은 저장할 때 **id 가 8 자 넘는 텍스트·링크 요소를 무작위 8 자 id 로 바꾼다**
+ * Excalidraw 플러그인은 `## Text Elements` 를 **정확히 8 자 id**(`\s\^(.{8})\n+`)로만 끊어 읽는다.
+ * 8 자가 아닌 id 의 줄은 경계로 안 잡혀 **다음 8 자 id 의 텍스트에 통째로 붙는다** — 2026-09-23 에
+ * 텍스트 박스에 목록이 빨려 들어가던 사고의 진짜 원인(excalidraw 스킬이 만든 `desc:t0`·`th` 같은 id).
+ * 그리고 저장할 때 **8 자 넘는 텍스트·링크 요소 id 는 무작위 8 자로 바꾼다**
  * (`findNewTextElementsInScene`, `^블록참조` 를 쓰려고). ExcaliDash 웹이 만드는 id 는 20 자라 전부 걸리고,
  * 서버엔 원래 id 가 살아 있으니 당겨올 때마다 한 벌씩 더 생긴다(2026-09-23 `claude-text-1` 두 벌).
  *
@@ -2570,7 +2580,7 @@ function toLocalIds(remote: readonly unknown[], localIds: ReadonlySet<string>): 
     const map = new Map<string, string>();
     for (const element of remote) {
         const id = elementId(element);
-        if (id !== null && id.length > 8 && !localIds.has(id)) map.set(id, shortElementId(id));
+        if (id !== null && id.length !== 8 && !localIds.has(id)) map.set(id, shortElementId(id));
     }
     return remapElementIds(remote, map);
 }
@@ -2580,11 +2590,13 @@ function toRemoteIds(local: readonly unknown[], remoteIds: Iterable<string>): un
     const localIds = new Set(
         local.map((element) => elementId(element)).filter((id): id is string => id !== null),
     );
+    const remote = new Set(remoteIds);
     const map = new Map<string, string>();
-    for (const id of remoteIds) {
-        if (id.length <= 8 || localIds.has(id)) continue;
+    for (const id of remote) {
+        if (id.length === 8 || localIds.has(id)) continue;
         const short = shortElementId(id);
-        if (localIds.has(short)) map.set(short, id);
+        // 서버가 짧은 id 자체를 갖고 있으면(서버 쪽 id 정리 뒤) 되돌리지 않는다.
+        if (localIds.has(short) && !remote.has(short)) map.set(short, id);
     }
     return remapElementIds(local, map);
 }
@@ -2603,31 +2615,35 @@ function withTombstones(
     remoteElements: readonly unknown[],
     knownIds?: ReadonlySet<string>,
 ): ExcalidrawScene {
-    const elements = Array.isArray(scene.elements) ? scene.elements : [];
-    const liveIds = new Set(
-        elements
-            .filter((element) => isLiveElement(element))
-            .map((element) => elementId(element))
-            .filter((id): id is string => id !== null),
-    );
+    // id 당 한 벌만 보낸다. 열린 도면은 화면(지운 요소 포함)을 올리므로, 로컬에 이미 죽은 사본이 있는 id 에
+    // tombstone 을 또 붙이면 서버에 같은 id 가 두 벌 쌓이고 push 마다 불어난다(2026-09-23 05:35, 146→1,198).
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const element of Array.isArray(scene.elements) ? scene.elements : []) {
+        const id = elementId(element);
+        if (id === null) continue;
+        const e = element as Record<string, unknown>;
+        const prev = byId.get(id);
+        if (prev === undefined || Number(e.version ?? 0) > Number(prev.version ?? 0)) byId.set(id, e);
+    }
     const stamp = Date.now();
-    const tombstones = remoteElements
-        .filter((element) => {
-            const id = elementId(element);
-            // 본 적 없는 요소는 남이 방금 그린 것이다 — 우리가 지운 게 아니다.
-            return id !== null && !liveIds.has(id) && (knownIds === undefined || knownIds.has(id));
-        })
-        .map((element) => ({
-            ...(element as Record<string, unknown>),
+    for (const element of remoteElements) {
+        const id = elementId(element);
+        if (id === null) continue;
+        const mine = byId.get(id);
+        if (mine !== undefined && isLiveElement(mine)) continue;
+        // 본 적 없는 요소는 남이 방금 그린 것이다 — 우리가 지운 게 아니다.
+        if (mine === undefined && knownIds !== undefined && !knownIds.has(id)) continue;
+        const theirs = element as Record<string, unknown>;
+        const base = mine ?? theirs;
+        byId.set(id, {
+            ...base,
             isDeleted: true,
-            version: Math.max(
-                Number((element as Record<string, unknown>).version ?? 0) + 1,
-                stamp,
-            ),
+            version: Math.max(Number(theirs.version ?? 0) + 1, Number(base.version ?? 0) + 1, stamp),
             versionNonce: stamp,
-        }));
+        });
+    }
 
-    return { ...scene, elements: [...elements, ...tombstones] };
+    return { ...scene, elements: [...byId.values()] };
 }
 
 /** 라이브러리 항목을 id 로 합친다. 같은 id 면 created 가 큰 쪽(더 최근에 만든 것)을 남긴다. */

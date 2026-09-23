@@ -109,6 +109,12 @@ for (let i = 0; i < lines.length; i++) {
     }
 }
 
+// ④-2 push 는 열린 도면이면 파일이 아니라 화면을 읽어야 한다. 파일은 자동 저장만큼 늦어서, 실시간으로
+//      받은 요소가 파일에 없으면 "지웠다" 로 보고 tombstone 을 쏜다(2026-09-23 05:25, 라벨 14 개가 지워짐).
+if (!/openExcalidrawView\(/.test(methodBody("syncFile").map(([, t]) => t).join("\n"))) {
+    fail.push("syncFile 이 열린 뷰를 보지 않는다 — 늦은 파일로 push 하면 방금 받은 요소를 지운다");
+}
+
 // ⑤ 검사가 발화하는지 — 사고 당시의 호출을 넣어보면 ①에 걸려야 한다
 {
     const injected = ["    async recordSync(", "        await this.app.fileManager.processFrontMatter(file, () => {});", "    }"].join("\n");

@@ -1,5 +1,30 @@
 # ExcaliDash Live
 
+> ## ⛔ Discontinued — this experiment failed
+>
+> **Do not use this plugin.** On its first day of real-time use it deleted labels from a live
+> drawing three times and, once, multiplied the drawing's elements with every save
+> (146 → 1,246). All four incidents came from one design mistake: the plugin **inferred
+> deletions** ("present on the server, absent locally, so it was deleted") and stamped those
+> tombstones with `Date.now()` versions that beat every real edit. Any stale or incomplete
+> local copy — a file still waiting for Excalidraw's 60-second autosave, a view holding old
+> tombstones — became a mass delete. Syncing the same drawing through Obsidian LiveSync *and*
+> ExcaliDash added a feedback loop on top.
+>
+> What we do instead: drawings live **only in ExcaliDash**, which already does multi-user
+> real-time editing; Obsidian notes just link to them.
+>
+> If you try this again, keep to four rules (details in `docs/current_status.md` and
+> `docs/issues.md` #9–#10):
+> 1. Only the editor creates deletions (`isDeleted` + the editor's own version). Absence is not deletion; never invent versions.
+> 2. The only local source is the open view. Never push from file-change events.
+> 3. Sync each drawing through exactly one path.
+> 4. Obsidian Excalidraw reads `## Text Elements` by **exactly 8-character ids** (`\s\^(.{8})\n+`); any other id length makes lines bleed into the next text element.
+>
+> The probes (`scripts/probe-*.mjs`) and checks (`scripts/verify-*.mjs`) are still accurate
+> about ExcaliDash's socket.io protocol and may be useful on their own.
+
+
 > **This is a fork.** It builds on [`siredvin/excalidash-obsidian-sync`](https://github.com/siredvin/excalidash-obsidian-sync)
 > (MIT, © 2026 SirEdvin), which already provides the ExcaliDash REST client, authentication,
 > frontmatter contract, scene parsing and collection resolution. **All of that is theirs.**

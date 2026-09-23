@@ -2,7 +2,7 @@
 //
 //   node scripts/verify-live.mjs
 //
-// ① Excalidraw 플러그인은 저장할 때 id 가 8 자 넘는 텍스트를 무작위 8 자로 바꾼다. 매핑이 없으면
+// ① Excalidraw 플러그인은 `## Text Elements` 를 정확히 8 자 id 로만 끊어 읽고, 저장할 때 8 자 넘는 텍스트 id 를 무작위 8 자로 바꾼다. 매핑이 없으면
 //    당겨올 때마다 한 벌씩 늘어난다(2026-09-23 `claude-text-1` 두 벌). 그 플러그인 동작을 흉내 내서
 //    옛 방식이 실제로 불어나는지, 새 방식은 안 불어나는지 본다.
 // ② 실시간이면 서버에 남이 방금 그린 요소가 늘 있다. "로컬에 없으면 지운 것" 이면 그걸 지운다.
@@ -36,6 +36,7 @@ const names = {
     toLocalIds: "function toLocalIds(",
     toRemoteIds: "function toRemoteIds(",
     LiveRoom: "class LiveRoom {",
+    rewriteTextElementsSection: "function rewriteTextElementsSection(",
 };
 const ts = Object.entries(names).map(([n, h]) => extract(n, h)).join("\n\n");
 const js = esbuild.transformSync(
@@ -79,6 +80,44 @@ const pluginSave = (els) => els.map((e) => (e.type === "text" && e.id.length > 8
     if (ids(back).sort().join(",") !== ids(server).sort().join(",")) fail.push(`되돌린 id 가 서버와 다르다: ${ids(back)}`);
 }
 
+// ① 8 자가 아닌 id 는 플러그인 파서에서 경계가 안 된다 — 파서를 그대로 흉내 내서 확인
+//    (main.js: `e.matchAll(/\s\^(.{8})[\n]+/g)` 로 끊고, 텍스트 = 직전 끝부터 매치 위치까지, 다음 시작 = index + 12)
+{
+    const parse = (md) => {
+        const body = md.slice(md.indexOf("## Text Elements\n") + "## Text Elements\n".length);
+        const out = new Map();
+        let o = 0;
+        for (const m of body.matchAll(/\s\^(.{8})[\n]+/g)) {
+            out.set(m[1], body.substring(o, m.index));
+            o = m.index + 12;
+        }
+        return out;
+    };
+    const RAW = "# Excalidraw Data\n\n## Text Elements\nx ^zzzzzzzz\n\n## Drawing\n```compressed-json\nAAAA\n```\n%%";
+    const server = [text("th", 1, { text: "제목" }), text("desc:t0", 1, { text: "데이터 파악" }), text("Mf1yOcozdC8yVlv8wO-jS", 1, { text: "Hello World" })];
+    const scene = (els) => ({ elements: els, appState: {}, files: {} });
+
+    // 대조군: 짧은 id 그대로면 마지막 8 자 id 텍스트에 앞의 목록이 빨려 들어간다
+    const oldMd = L.rewriteTextElementsSection(RAW, scene([...server.slice(0, 2), text("abcdefgh", 1, { text: "Hello World" })]));
+    const oldParsed = parse(oldMd);
+    if (!(oldParsed.get("abcdefgh") ?? "").includes("데이터 파악")) fail.push("대조군이 안 빨려 들어간다 — 검사 설계가 깨졌다");
+
+    // 새 방식: 전부 8 자로 매핑 → 각 텍스트가 제자리
+    const local = L.toLocalIds(server, new Set());
+    if (local.some((e) => e.id.length !== 8)) fail.push(`8 자가 아닌 id 가 남았다: ${ids(local)}`);
+    const parsed = parse(L.rewriteTextElementsSection(RAW, scene(local)));
+    for (const e of local) {
+        if (parsed.get(e.id) !== e.text) fail.push(`파서가 ${e.id} 를 "${String(parsed.get(e.id)).slice(0, 30)}" 로 읽는다 (기대 "${e.text}")`);
+    }
+}
+
+// ① 서버가 짧은 id 로 정리된 뒤에는 되돌리지 않는다
+{
+    const short = L.shortElementId("desc:t0");
+    const back = L.toRemoteIds([text(short)], ["desc:t0", short]);
+    if (back[0].id !== short) fail.push("서버에 이미 있는 짧은 id 를 옛 id 로 되돌렸다 — 편집이 죽은 요소로 간다");
+}
+
 // ① 참조도 같이 바뀐다 (컨테이너 안 글자·화살표 바인딩)
 {
     const box = rect("container-with-long-id", 1, { boundElements: [{ id: "bound-text-long-id", type: "text" }] });
@@ -111,6 +150,25 @@ const pluginSave = (els) => els.map((e) => (e.type === "text" && e.id.length > 8
     const out = L.withTombstones(scene, remote, known).elements;
     if (out.some((e) => e.id === "theirs-new")) fail.push("본 적 없는 남의 신규 요소를 지웠다");
     if (!out.some((e) => e.id === "mine-deleted" && e.isDeleted)) fail.push("내가 지운 요소가 tombstone 으로 안 나갔다");
+}
+
+// ② 화면을 올릴 때(지운 요소 포함) 같은 id 가 두 벌 나가면 안 된다 — push 마다 서버에서 불어난다
+{
+    const remote = [rect("x", 5, { isDeleted: true }), rect("y", 3)];
+    const scene = { elements: [rect("x", 6, { isDeleted: true }), rect("keep", 1)], appState: {}, files: {} };
+    const out = L.withTombstones(scene, remote, new Set(["x", "y"])).elements;
+    const counts = {};
+    for (const e of out) counts[e.id] = (counts[e.id] ?? 0) + 1;
+    const dup = Object.entries(counts).filter(([, n]) => n > 1).map(([id]) => id);
+    if (dup.length > 0) fail.push(`같은 id 가 두 벌 나간다: ${dup} — 서버에서 push 마다 불어난다`);
+    const x = out.find((e) => e.id === "x");
+    if (!(x?.isDeleted === true && x.version > 6)) fail.push("로컬에서 죽은 id 가 더 큰 version 의 tombstone 으로 안 나갔다");
+    if (!out.find((e) => e.id === "y")?.isDeleted) fail.push("본 적 있는데 로컬에 없는 y 가 tombstone 으로 안 나갔다");
+    if (out.find((e) => e.id === "keep")?.isDeleted !== false) fail.push("로컬 전용 요소가 죽었다");
+
+    // 대조군: 옛 방식(로컬 요소 + tombstone 을 이어 붙임)은 x 가 두 벌이다
+    const legacy = [...scene.elements, ...remote.filter((e) => !["keep"].includes(e.id)).map((e) => ({ ...e, isDeleted: true }))];
+    if (legacy.filter((e) => e.id === "x").length !== 2) fail.push("대조군이 두 벌이 아니다 — 검사 설계가 깨졌다");
 }
 
 // ③ 바뀐 것만 보내고, 받은 건 되돌려 보내지 않는다
