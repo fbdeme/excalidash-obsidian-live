@@ -2,14 +2,58 @@
 
 > 최종 업데이트: 2026-09-23 (**양방향 동작** — push·pull·라이브러리 공유. 열린 뷰 주입까지. ▶ 다음 = socket.io 실시간)
 
-## ▶ 다음 세션
+## ▶ 다음 세션 — 실시간(C) 이어가기 (2026-09-23 compact 핸드오프)
 
-**양방향이 닫혔다.** 사용자 실측: ExcaliDash 에서 그린 것이 Obsidian 에 들어오고, Obsidian 에서 그린 것이 ExcaliDash 로 나간다. 도면을 **열어둔 채로도** 반영된다.
+양방향은 **끝났다**(아래 "지금 되는 것"). 남은 건 실시간 하나고, **조각이 전부 검증돼 있다.**
 
-1. **실시간(C)** — 남은 건 socket.io `element-update` 를 받아 `pullIntoOpenView` 를 부르는 것뿐이다. 프로토콜은 probe 로 증명했고(아래), 뷰 주입 경로도 뚫렸다.
-2. 텍스트 요소 **id 재발급** 확인 — 뷰 주입 뒤 id 가 바뀌는 것으로 보인다(Issue #8 남은 관찰). id 기준 병합의 전제라 실시간 전에 확인할 것.
-3. 모바일(아이패드)에서 socket.io 가 되는가 — 아직 미확인.
-4. 프로젝트별 도면 목록 노트 자동 생성(매핑 5·6번).
+### 남은 작업은 배선 하나다
+
+```
+socket.io `element-update` 수신  →  이미 있는 pullIntoOpenView() 호출
+```
+
+- **프로토콜**: `scripts/probe-socket.mjs` · `probe-roundtrip.mjs` 로 증명 완료.
+  `join-room {drawingId, user}` → `element-update {drawingId, elements, files, elementOrder}`.
+- **인증**: 핸드셰이크는 **로그인 JWT 만**(API 키는 403·거부). `loginWithPassword` 재사용.
+  ⚠️ access 토큰 TTL **15 분** → 재접속 필요(Issue #5).
+- **보내기**: `element-update` 에 **`drawingId` 가 없으면 서버가 조용히 버린다**(`socket.ts:288`).
+- **저장**: socket 은 **중계만** 한다. 영속화는 REST — 그래서 2 채널(저장 REST · socket 알림·전파)을 유지한다.
+- **반영**: 열린 도면은 `pullIntoOpenView()` 가 `ExcalidrawAutomate.viewUpdateScene()` 으로 넣는다. **이미 동작 확인됨**(사용자 실측).
+
+### 착수 전에 확인할 것 둘
+
+1. 🔴 **텍스트 요소 id 가 재발급되는가** — 뷰 주입 뒤 보낸 `claude-text-1` 이 `Y706lL3o`·`eM8rM5eU` **두 벌**로 들어왔다. id 기준 병합의 전제라 실시간에서는 중복이 계속 쌓인다. 여기부터 확인할 것(Issue #8 남은 관찰).
+2. 모바일(아이패드)에서 socket.io 가 되는가 — 주 편집 기기인데 미확인. `requestUrl` 은 HTTP CORS 만 우회하고 WebSocket 은 별개.
+
+### 설계 원칙 (어기면 오늘 사고가 재현된다)
+
+- **`.excalidraw.md` 를 부분만 고치지 않는다.** 압축 씬과 `## Text Elements` 가 어긋나면 그 파일은 저장할 때마다 유령을 재생산한다(Issue #8).
+- 열린 도면 → **파일 금지**, 뷰 주입만. 닫힌 도면 → 파일 쓰기 + `## Text Elements` 재생성.
+- 서버(셸)에서 vault 의 도면 파일을 고치지 않는다. 정리는 **ExcaliDash REST** 로 — 도면을 열어둔 채로도 안전하다.
+- 병합은 **요소 단위 version 승**. 승자를 고르지 않으므로 다자 편집에 그대로 맞는다.
+
+### 검사 8 종 (전부 "옛 방식이면 실패" 를 함께 확인한다)
+
+`verify-compressed-json` · `verify-collection-resolution` · `verify-set-cookie-parsing` ·
+`verify-auto-sync-debounce` · `verify-tombstones` · `verify-no-drawing-writes` ·
+`verify-merge` · `verify-text-elements-section`
+
+```bash
+for s in scripts/verify-*.mjs; do node "$s" || echo "FAIL $s"; done
+```
+
+### 배포 방법
+
+```bash
+npm run build
+scp main.js gram:"/mnt/c/Users/MGJEON/Documents/obsidian-home/.obsidian/plugins/excalidash-live/main.js"
+# 사용자가 Obsidian 에서 플러그인 토글 off/on
+```
+
+### upstream 에 돌려줄 것 (실시간과 무관, PR 로 분리 가능)
+
+- `set-cookie` 가 배열이면 `.trim()` 으로 죽는 버그
+- 삭제가 tombstone 없이 전송돼 서버에 유령이 남는 문제
 
 ## 지금 되는 것 (2026-09-23 실측)
 
