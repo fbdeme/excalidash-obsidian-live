@@ -1484,13 +1484,22 @@ function mergeSessionCookies(
     return { cookieHeader: Array.from(jar.values()).join("; ") };
 }
 
-function extractSetCookies(headers: Record<string, string>): string[] {
-    for (const [key, value] of Object.entries(headers)) {
-        if (key.toLowerCase() === "set-cookie" && value.trim().length > 0) {
-            return value
-                .split(/,(?=\s*[^;,\s]+=)/)
-                .map((item) => item.trim())
-                .filter((item) => item.length > 0);
+function extractSetCookies(headers: Record<string, unknown>): string[] {
+    for (const [key, value] of Object.entries(headers ?? {})) {
+        if (key.toLowerCase() !== "set-cookie") {
+            continue;
+        }
+
+        // Obsidian's requestUrl returns multi-value headers as an array on some
+        // platforms, so set-cookie is not always a string. Calling .trim() on it
+        // blows up with "x.trim is not a function" before login is even attempted.
+        const items = (Array.isArray(value) ? value : [value])
+            .filter((item): item is string => typeof item === "string")
+            .flatMap((item) => item.split(/,(?=\s*[^;,\s]+=)/))
+            .map((item) => item.trim())
+            .filter((item) => item.length > 0);
+        if (items.length > 0) {
+            return items;
         }
     }
 

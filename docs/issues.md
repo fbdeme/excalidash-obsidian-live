@@ -60,3 +60,23 @@ ExcaliDash 백엔드는 `fileId` 가 `^[\w-]{1,200}$` 가 아니면 `delete resu
 **상태: 🔄 열림**
 
 `ACCESS_TOKEN_COOKIE_NAME = "excalidash-access-token"`, 기본 TTL 15분(refresh 는 7일). 상시 연결을 유지하려면 만료 전에 갱신하거나 재로그인해야 한다. 우리 인스턴스는 `JWT_REFRESH_EXPIRES_IN=365d` 로 늘려 뒀지만 **access 쪽은 그대로**다. 재연결 시 조용히 실패하지 않도록 만료를 다뤄야 한다.
+
+---
+
+## Issue #6: `set-cookie` 가 배열이면 로그인 전에 죽는다 (upstream 버그, 수정함)
+**상태: ✅ 해결됨 (2026-09-23)**
+
+### 문제
+"Generate API key from login" 이 **`i.trim is not a function`** 으로 죽었다. 로그인 시도조차 못 한다 — 그 앞의 CSRF 응답 파싱 단계에서 터진다.
+
+### 원인
+`extractSetCookies(headers: Record<string, string>)` 가 헤더 값을 **항상 문자열로 가정**하고 `value.trim()` 을 부른다. Obsidian 의 `requestUrl` 은 다중 헤더(특히 `set-cookie`)를 **배열**로 돌려줄 수 있다.
+
+### 해결
+값이 배열이면 펼치고, 문자열이 아닌 항목은 버린다. 헤더 객체 자체가 없어도 견딘다.
+
+### 검사
+`scripts/verify-set-cookie-parsing.mjs` — 함수를 **복사하지 않고 `main.ts` 에서 뽑아** 돌린다(복사본은 원본이 되돌아가도 계속 통과한다). 옛 구현이 배열에서 **실제로 터지는지**까지 확인하므로 통과가 의미를 가진다. 수정을 되돌리면 exit 1 (실측).
+
+### upstream 에 돌려줄 것
+이건 실시간과 무관한 순수 버그 수정이라 **PR 대상**이다. `feat/realtime-collab` 에서 떼어 별도 브랜치로 올릴 것.
