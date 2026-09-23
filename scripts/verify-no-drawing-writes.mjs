@@ -35,7 +35,8 @@ function methodBody(name) {
 const fail = [];
 
 // ① 동기화 경로는 도면 파일을 쓰면 안 된다
-for (const name of ["syncFile", "recordSync", "autoSyncFile", "queueAutoSync", "resolveDrawingState", "pullIntoOpenView"]) {
+for (const name of ["syncFile", "recordSync", "autoSyncFile", "queueAutoSync", "resolveDrawingState", "pullIntoOpenView",
+    "applyRemoteToView", "refreshLive", "flushLive", "onLiveUpdate", "joinLive", "socketFor", "rememberSeen"]) {
     for (const [lineNo, text] of methodBody(name)) {
         if (WRITE_API.test(text)) {
             fail.push(`${name} 안에서 파일을 쓴다 — ${SOURCE}:${lineNo}  ${text.trim().slice(0, 70)}`);
@@ -88,10 +89,19 @@ for (let i = 0; i < lines.length; i++) {
             fail.push(`${name} 이 열린 도면을 뷰 경로로 보내지 않는다`);
         }
     }
-    // 뷰 주입은 파일이 아니라 Excalidraw 의 API 로 해야 한다
-    const inject = methodBody("pullIntoOpenView").map(([, t]) => t).join("\n");
-    if (!/viewUpdateScene\(/.test(inject)) {
-        fail.push("pullIntoOpenView 가 viewUpdateScene 을 쓰지 않는다 — 그러면 뷰에 반영되지 않는다");
+    // 뷰 주입은 파일이 아니라 Excalidraw 뷰의 API 로 해야 한다 — pull 과 실시간 수신이 같은 길을 탄다
+    if (!/applyRemoteToView\(/.test(methodBody("pullIntoOpenView").map(([, t]) => t).join("\n"))) {
+        fail.push("pullIntoOpenView 가 applyRemoteToView 를 거치지 않는다");
+    }
+    if (!/applyRemoteToView\(/.test(methodBody("onLiveUpdate").map(([, t]) => t).join("\n"))) {
+        fail.push("실시간 수신(onLiveUpdate)이 applyRemoteToView 를 거치지 않는다");
+    }
+    const inject = methodBody("applyRemoteToView").map(([, t]) => t).join("\n");
+    if (!/view\.updateScene\(/.test(inject)) {
+        fail.push("applyRemoteToView 가 view.updateScene 을 쓰지 않는다 — 그러면 뷰에 반영되지 않는다");
+    }
+    if (!/getSceneElementsIncludingDeleted\(/.test(inject)) {
+        fail.push("applyRemoteToView 가 지운 요소 없이 합친다 — 로컬에서 지운 게 옛 version 으로 되살아난다");
     }
     const guard = methodBody("isOpenInExcalidrawView").map(([, t]) => t).join("\n");
     if (!/getLeavesOfType\("excalidraw"\)/.test(guard)) {

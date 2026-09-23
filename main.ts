@@ -14,6 +14,7 @@ import {
     requestUrl,
 } from "obsidian";
 import { compressToBase64, decompressFromBase64 } from "lz-string";
+import { io, Socket } from "socket.io-client";
 
 // Excalidraw 는 그리는 동안 파일을 계속 저장한다. 이 정도는 기다려야 획 하나마다 서버로 쏘지 않는다.
 const AUTO_SYNC_DEBOUNCE_MS = 2500;
@@ -27,6 +28,12 @@ const AUTO_SYNC_DEBOUNCE_MS = 2500;
  * 유령 요소를 스스로 재생산한다. 자세한 건 docs/issues.md Issue #8.
  */
 const AUTO_SYNC_ON_SAVE = true;
+
+/**
+ * 열린 도면에서 바뀐 요소를 소켓으로 내보내는 주기. 파일 저장에 기대면 Excalidraw 의 자동 저장
+ * (데스크톱 60 초 · 모바일 30 초)만큼 늦으므로, 웹 클라이언트처럼 뷰를 직접 읽는다.
+ */
+const LIVE_FLUSH_MS = 300;
 
 const DEFAULT_API_PATH_PREFIX = "/api";
 const DEFAULT_CSRF_ENDPOINT = "/csrf-token";
@@ -56,6 +63,12 @@ interface SyncState {
     version: number;
     lastHash: string;
     lastSynced: string;
+    /**
+     * 이 도면에서 로컬이 **본 적 있는** 서버 id. 로컬에 없는 서버 요소 중 여기 있는 것만 "지웠다" 로
+     * 친다 — 없는 것은 남이 방금 그린 것이다. 실시간이면 서버 version 이 늘 바뀌어 옛 "충돌이면 멈춤"
+     * 규칙으로는 영영 못 올리므로, 이걸로 삭제와 신규를 가른다.
+     */
+    knownIds?: string[];
 }
 
 interface ExcaliDashSyncSettings {
@@ -99,6 +112,62 @@ interface ExcaliDashDrawing extends ExcalidrawScene {
     collectionId?: string | null;
 }
 
+/** Excalidraw 플러그인의 뷰 중 우리가 쓰는 부분. */
+interface ExcalidrawViewLike {
+    excalidrawAPI: { getSceneElementsIncludingDeleted(): unknown[] };
+    updateScene(scene: { elements: unknown[]; captureUpdate?: string }): void;
+}
+
+/** 열린 도면 하나의 실시간 상태. 보낸(또는 받은) 요소의 version 을 기억해 바뀐 것만 보낸다. */
+class LiveRoom {
+    private sent = new Map<string, Record<string, unknown>>();
+    /** 방에 (다시) 들어간 뒤 REST 로 한 번 따라잡아야 한다 — 끊긴 동안 놓친 편집. */
+    needsCatchUp = true;
+    busy = false;
+
+    constructor(
+        readonly file: TFile,
+        readonly target: ExcaliDashTarget,
+        readonly drawingId: string,
+    ) {}
+
+    markSent(elements: readonly unknown[]): void {
+        for (const element of elements) {
+            const id = elementId(element);
+            if (id !== null) this.sent.set(id, element as Record<string, unknown>);
+        }
+    }
+
+    /** 지난번 이후 바뀐 요소 + 씬에서 아예 사라진 요소(플러그인의 id 교체 등)는 tombstone 으로. */
+    takeChanges(elements: readonly unknown[]): unknown[] {
+        const out: unknown[] = [];
+        const present = new Set<string>();
+        for (const element of elements) {
+            const id = elementId(element);
+            if (id === null) continue;
+            present.add(id);
+            const e = element as Record<string, unknown>;
+            const prev = this.sent.get(id);
+            if (prev === undefined || prev.version !== e.version || prev.versionNonce !== e.versionNonce) {
+                out.push(e);
+                this.sent.set(id, e);
+            }
+        }
+        for (const [id, prev] of this.sent) {
+            if (present.has(id)) continue;
+            this.sent.delete(id);
+            if (prev.isDeleted === true) continue;
+            out.push({
+                ...prev,
+                isDeleted: true,
+                version: Number(prev.version ?? 0) + 1,
+                versionNonce: Math.floor(Math.random() * 2 ** 31),
+            });
+        }
+        return out;
+    }
+}
+
 interface ExcaliDashCollection {
     id: string;
     name?: string;
@@ -124,6 +193,8 @@ export default class ExcaliDashSyncPlugin extends Plugin {
     settings: ExcaliDashSyncSettings = DEFAULT_SETTINGS;
     private autoSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private autoSyncRunning = new Set<string>();
+    private live = new Map<string, LiveRoom>();
+    private sockets = new Map<string, Socket>();
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -210,6 +281,115 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         });
 
         this.addSettingTab(new ExcaliDashSettingTab(this.app, this));
+
+        // 실시간: 열린 도면마다 ExcaliDash 방에 들어간다. 저장(REST)은 그대로 두고, 소켓은 전파만 한다.
+        this.app.workspace.onLayoutReady(() => this.refreshLive());
+        this.registerEvent(this.app.workspace.on("layout-change", () => this.refreshLive()));
+        this.registerInterval(window.setInterval(() => void this.flushLive(), LIVE_FLUSH_MS));
+    }
+
+    /** 열린 opt-in 도면과 방 목록을 맞춘다. */
+    refreshLive(): void {
+        const open = new Set<string>();
+        for (const leaf of this.app.workspace.getLeavesOfType("excalidraw")) {
+            const path = (leaf.getViewState().state as { file?: unknown } | undefined)?.file;
+            const file = typeof path === "string" ? this.app.vault.getAbstractFileByPath(path) : null;
+            if (!(file instanceof TFile)) continue;
+            const frontmatter = this.resolveDrawingState(
+                file,
+                parseDrawingFrontmatter(this.app.metadataCache.getFileCache(file)?.frontmatter),
+            );
+            const target = this.settings.targets.find((item) => item.name === frontmatter.destination);
+            // 소켓은 로그인 JWT 로만 들어간다(API 키는 거부). 비밀번호가 없으면 저장 동기화만 한다.
+            if (frontmatter.id === undefined || target === undefined || target.password.length === 0) continue;
+            open.add(file.path);
+            if (this.live.has(file.path)) continue;
+            const room = new LiveRoom(file, target, frontmatter.id);
+            this.live.set(file.path, room);
+            const socket = this.socketFor(target);
+            if (socket.connected) this.joinLive(socket, room);
+        }
+        // ponytail: 서버에 leave-room 이 없다. 닫은 도면의 방 이벤트는 onLiveUpdate 에서 무시된다.
+        for (const path of [...this.live.keys()]) {
+            if (!open.has(path)) this.live.delete(path);
+        }
+    }
+
+    socketFor(target: ExcaliDashTarget): Socket {
+        const existing = this.sockets.get(target.name);
+        if (existing !== undefined) return existing;
+        const socket = io(new URL(target.baseUrl).origin, {
+            path: "/socket.io",
+            transports: ["websocket"],
+            // 접속할 때마다 새로 로그인한다. access 토큰 TTL 이 15 분이라(Issue #5) 재접속엔 새 토큰이
+            // 필요하고, 서버는 핸드셰이크에서만 토큰을 본다 — 붙어 있는 동안은 만료돼도 끊기지 않는다.
+            auth: (cb) => {
+                accessTokenFor(target).then(
+                    (token) => cb({ token }),
+                    () => cb({}),
+                );
+            },
+        });
+        socket.on("connect", () => {
+            for (const room of this.live.values()) {
+                if (room.target.name === target.name) this.joinLive(socket, room);
+            }
+        });
+        socket.on("element-update", (data: unknown) => this.onLiveUpdate(target, data));
+        socket.on("error", (error: unknown) => console.warn("ExcaliDash Live socket error", error));
+        this.sockets.set(target.name, socket);
+        return socket;
+    }
+
+    joinLive(socket: Socket, room: LiveRoom): void {
+        room.needsCatchUp = true;
+        socket.emit("join-room", {
+            drawingId: room.drawingId,
+            user: { id: "obsidian", name: "Obsidian" },
+        });
+    }
+
+    onLiveUpdate(target: ExcaliDashTarget, data: unknown): void {
+        if (!isRecord(data) || typeof data.drawingId !== "string" || !Array.isArray(data.elements)) return;
+        for (const room of this.live.values()) {
+            if (room.drawingId !== data.drawingId || room.target.name !== target.name) continue;
+            const view = this.openExcalidrawView(room.file);
+            // ponytail: 첨부 파일(이미지)은 소켓으로 안 받는다 — 저장 뒤 pull 로 들어온다.
+            if (view !== null) this.applyRemoteToView(room.file, view, data.elements);
+        }
+    }
+
+    /** 방마다: 들어간 직후면 REST 로 따라잡고, 아니면 바뀐 요소만 소켓으로 보낸다. */
+    async flushLive(): Promise<void> {
+        for (const room of this.live.values()) {
+            if (room.busy) continue;
+            const socket = this.sockets.get(room.target.name);
+            const view = this.openExcalidrawView(room.file);
+            if (socket?.connected !== true || view === null) continue;
+
+            if (room.needsCatchUp) {
+                room.busy = true;
+                try {
+                    const frontmatter = this.resolveDrawingState(
+                        room.file,
+                        parseDrawingFrontmatter(this.app.metadataCache.getFileCache(room.file)?.frontmatter),
+                    );
+                    const result = await this.pullIntoOpenView(room.file, room.target, frontmatter);
+                    if (result.status !== "error") room.needsCatchUp = false;
+                } finally {
+                    room.busy = false;
+                }
+                continue;
+            }
+
+            const changes = room.takeChanges(view.excalidrawAPI.getSceneElementsIncludingDeleted());
+            if (changes.length === 0) continue;
+            // 서버 id 로 되돌려 보낸다. drawingId 가 없으면 서버가 조용히 버린다(socket.ts:288).
+            socket.emit("element-update", {
+                drawingId: room.drawingId,
+                elements: toRemoteIds(changes, this.knownIdsOf(room.file) ?? []),
+            });
+        }
     }
 
     async loadSettings(): Promise<void> {
@@ -223,6 +403,9 @@ export default class ExcaliDashSyncPlugin extends Plugin {
     }
 
     onunload(): void {
+        for (const socket of this.sockets.values()) socket.disconnect();
+        this.sockets.clear();
+        this.live.clear();
         for (const timer of this.autoSyncTimers.values()) {
             clearTimeout(timer);
         }
@@ -391,38 +574,28 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         target: ExcaliDashTarget,
         frontmatter: DrawingFrontmatter,
     ): Promise<SyncResult> {
-        const ea = getExcalidrawAutomate(this.app);
-        const leaf = this.app.workspace
-            .getLeavesOfType("excalidraw")
-            .find((item) => {
-                const state = item.getViewState().state as { file?: unknown } | undefined;
-                return state?.file === file.path;
-            });
-        if (ea === null || leaf === undefined) {
+        const view = this.openExcalidrawView(file);
+        if (view === null) {
             return {
                 path: file.path,
                 status: "error",
-                message: "Excalidraw scripting API unavailable — close the drawing and pull again.",
+                message: "Excalidraw view not ready — close the drawing and pull again.",
             };
         }
 
         try {
-            ea.reset();
-            if (ea.setView(leaf.view) === null) {
-                return { path: file.path, status: "error", message: "Could not attach to the open view." };
-            }
-            const current = ea.getViewElements() as unknown[];
             const remote = await getRemoteDrawing(target, frontmatter.id as string);
-            const { scene, changed } = mergeScenes(
-                { elements: [...current], appState: {}, files: {} },
-                remote.elements ?? [],
+            const changed = this.applyRemoteToView(file, view, remote.elements ?? []);
+            await this.recordSync(
+                file,
+                remote.id,
+                remote.version,
+                frontmatter.lastHash ?? "",
+                liveIdsOf(remote.elements ?? []),
             );
             if (changed === 0) {
-                await this.recordSync(file, remote.id, remote.version, frontmatter.lastHash ?? "");
                 return { path: file.path, status: "skipped", message: "Already up to date." };
             }
-            ea.viewUpdateScene({ elements: scene.elements, commitToHistory: true });
-            await this.recordSync(file, remote.id, remote.version, await sceneHash(scene));
             return {
                 path: file.path,
                 status: "synced",
@@ -432,6 +605,47 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             const message = error instanceof Error ? error.message : String(error);
             return { path: file.path, status: "error", message };
         }
+    }
+
+    /** 이 파일을 연 Excalidraw 뷰. 아직 API 가 붙지 않았으면 null. */
+    openExcalidrawView(file: TFile): ExcalidrawViewLike | null {
+        const leaf = this.app.workspace
+            .getLeavesOfType("excalidraw")
+            .find((item) => {
+                const state = item.getViewState().state as { file?: unknown } | undefined;
+                return state?.file === file.path;
+            });
+        const view = leaf?.view as unknown as ExcalidrawViewLike | undefined;
+        return view?.excalidrawAPI?.getSceneElementsIncludingDeleted === undefined ? null : view;
+    }
+
+    /**
+     * 서버 요소를 **열린 뷰에** 넣는다. 파일은 거치지 않는다 — 부분 수정하면 압축 씬과
+     * `## Text Elements` 가 어긋나 도면이 망가진다(2026-09-23). 저장은 Excalidraw 플러그인이 한다.
+     *
+     * 지운 요소까지 포함한 씬과 합친다. 안 그러면 로컬에서 지운 요소가 옛 version 으로 되살아난다.
+     */
+    applyRemoteToView(file: TFile, view: ExcalidrawViewLike, remoteElements: readonly unknown[]): number {
+        const current = view.excalidrawAPI.getSceneElementsIncludingDeleted();
+        const currentIds = new Set(
+            current.map((e) => elementId(e)).filter((id): id is string => id !== null),
+        );
+        const incoming = toLocalIds(remoteElements, currentIds);
+        const { scene, changed } = mergeScenes(
+            { elements: [...current], appState: {}, files: {} },
+            incoming,
+        );
+        this.rememberSeen(
+            file,
+            remoteElements.map((e) => elementId(e)).filter((id): id is string => id !== null),
+        );
+        if (changed === 0) return 0;
+        // 남의 편집이 내 실행 취소(undo) 기록에 섞이지 않게 한다.
+        view.updateScene({ elements: scene.elements, captureUpdate: "NEVER" });
+        // 받은 쪽이 이긴 요소만 "보냄" 으로 친다 — 되돌려 보내지 않되, 로컬 전용 편집은 계속 나가게.
+        const won = new Set(incoming);
+        this.live.get(file.path)?.markSent(scene.elements.filter((e) => won.has(e)));
+        return changed;
     }
 
     async pullFile(
@@ -446,13 +660,20 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 return { path: file.path, status: "error", message: "Unable to parse Excalidraw scene." };
             }
             const remote = await getRemoteDrawing(target, frontmatter.id as string);
-            const { scene, changed } = mergeScenes(parsed.scene, remote.elements ?? []);
+            const localIds = new Set(
+                parsed.scene.elements.map((e) => elementId(e)).filter((id): id is string => id !== null),
+            );
+            const { scene, changed } = mergeScenes(
+                parsed.scene,
+                toLocalIds(remote.elements ?? [], localIds),
+            );
+            const seen = liveIdsOf(remote.elements ?? []);
             if (changed === 0) {
-                await this.recordSync(file, remote.id, remote.version, await sceneHash(parsed.scene));
+                await this.recordSync(file, remote.id, remote.version, await sceneHash(parsed.scene), seen);
                 return { path: file.path, status: "skipped", message: "Already up to date." };
             }
             await this.writeRemoteSceneToLocal(file, raw, parsed, scene);
-            await this.recordSync(file, remote.id, remote.version, await sceneHash(scene));
+            await this.recordSync(file, remote.id, remote.version, await sceneHash(scene), seen);
             return {
                 path: file.path,
                 status: "synced",
@@ -607,6 +828,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                     created.id,
                     created.version,
                     localHash,
+                    liveIdsOf(parsed.scene.elements ?? []),
                 );
                 return {
                     path: file.path,
@@ -617,6 +839,16 @@ export default class ExcaliDashSyncPlugin extends Plugin {
 
             const remote = await getRemoteDrawing(target, frontmatter.id);
             const remoteHash = await sceneHash(remote);
+            const remoteElements = remote.elements ?? [];
+            const remoteIds = remoteElements
+                .map((element) => elementId(element))
+                .filter((id): id is string => id !== null);
+            const known = this.knownIdsOf(file);
+            // 비교·전송은 서버 id 로 한다(짧게 바꾼 id 를 되돌린다).
+            const localScene: ExcalidrawScene = {
+                ...parsed.scene,
+                elements: toRemoteIds(parsed.scene.elements ?? [], remoteIds),
+            };
             const remoteChanged =
                 frontmatter.version !== undefined &&
                 remote.version !== frontmatter.version;
@@ -634,12 +866,20 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 remoteChanged &&
                 !localChanged
             ) {
-                await this.writeRemoteSceneToLocal(file, raw, parsed, remote);
+                if (this.isOpenInExcalidrawView(file)) {
+                    return await this.pullIntoOpenView(file, target, frontmatter);
+                }
+                const localIds = new Set(parsed.scene.elements.map((e) => elementId(e)).filter((id): id is string => id !== null));
+                await this.writeRemoteSceneToLocal(file, raw, parsed, {
+                    ...remote,
+                    elements: toLocalIds(remoteElements, localIds),
+                });
                 await this.recordSync(
                     file,
                     remote.id,
                     remote.version,
                     remoteHash,
+                    liveIdsOf(remoteElements),
                 );
                 return {
                     path: file.path,
@@ -648,7 +888,8 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 };
             }
 
-            if (remoteChanged) {
+            // 본 적 있는 id 기록이 없으면(옛 기록) 무엇이 신규인지 모르므로 예전처럼 멈춘다.
+            if (remoteChanged && known === undefined) {
                 return {
                     path: file.path,
                     status: "conflict",
@@ -658,9 +899,9 @@ export default class ExcaliDashSyncPlugin extends Plugin {
 
             // 원격에만 살아 있는 요소(= 로컬에서 지웠는데 서버가 들고 있는 것). 로컬이 그대로여도
             // 이게 남아 있으면 스킵하면 안 된다 — 안 그러면 유령을 치울 기회가 영영 없다.
-            const localLiveIds = liveIdsOf(parsed.scene.elements ?? []);
-            const remoteGhosts = [...liveIdsOf(remote.elements ?? [])].filter(
-                (id) => !localLiveIds.has(id),
+            const localLiveIds = liveIdsOf(localScene.elements);
+            const remoteGhosts = [...liveIdsOf(remoteElements)].filter(
+                (id) => !localLiveIds.has(id) && (known === undefined || known.has(id)),
             );
 
             if (!localChanged && !collectionChanged && remoteGhosts.length === 0) {
@@ -671,7 +912,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 };
             }
 
-            const outgoing = withTombstones(parsed.scene, remote.elements ?? []);
+            const outgoing = withTombstones(localScene, remoteElements, known);
             const updated = await updateRemoteDrawing(
                 target,
                 frontmatter.id,
@@ -688,6 +929,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 updated.id,
                 updated.version,
                 localHash,
+                liveIdsOf(mergeScenes({ ...remote, elements: [...remoteElements] }, outgoing.elements).scene.elements),
             );
 
             // 검증은 PUT 응답이 아니라 **다시 읽어서** 한다. 응답은 병합 전 상태를 담고 있어
@@ -695,7 +937,9 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             if (remoteGhosts.length > 0) {
                 const after = await getRemoteDrawing(target, updated.id);
                 const stillLive = liveIdsOf(after.elements ?? []);
-                const leftover = [...stillLive].filter((id) => !localLiveIds.has(id));
+                const leftover = [...stillLive].filter(
+                    (id) => !localLiveIds.has(id) && remoteGhosts.includes(id),
+                );
                 if (leftover.length > 0) {
                     return {
                         path: file.path,
@@ -734,14 +978,30 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         id: string,
         version: number,
         hash: string,
+        seenIds?: Iterable<string>,
     ): Promise<void> {
+        const previous = this.settings.syncState[file.path];
+        const knownIds = previous?.id === id ? (previous.knownIds ?? []) : [];
         this.settings.syncState[file.path] = {
             id,
             version,
             lastHash: hash,
             lastSynced: new Date().toISOString(),
+            knownIds: seenIds === undefined ? previous?.knownIds : [...new Set([...knownIds, ...seenIds])],
         };
         await this.saveSettings();
+    }
+
+    knownIdsOf(file: TFile): Set<string> | undefined {
+        const ids = this.settings.syncState[file.path]?.knownIds;
+        return ids === undefined ? undefined : new Set(ids);
+    }
+
+    /** 실시간으로 받은 id 도 "본 것" 이다. 저장은 다음 recordSync 에 묻어간다. */
+    rememberSeen(file: TFile, ids: Iterable<string>): void {
+        const state = this.settings.syncState[file.path];
+        if (state === undefined) return;
+        state.knownIds = [...new Set([...(state.knownIds ?? []), ...ids])];
     }
 
     /** frontmatter 의 opt-in 값 + 우리가 보관한 기록을 합친다. 기록이 없으면 옛 frontmatter 를 승계한다. */
@@ -1875,6 +2135,14 @@ async function loginWithPassword(
     return session;
 }
 
+/** 소켓 핸드셰이크용 access JWT. 로그인 쿠키에서 꺼낸다. */
+async function accessTokenFor(target: ExcaliDashTarget): Promise<string> {
+    const session = await loginWithPassword(target);
+    const match = /(?:^|;\s*)excalidash-access-token=([^;]+)/.exec(session.cookieHeader);
+    if (match === null) throw new Error("ExcaliDash login returned no access token.");
+    return match[1];
+}
+
 async function findExistingApiKey(
     target: ExcaliDashTarget,
     session: TemporarySession,
@@ -2253,6 +2521,74 @@ function mergeScenes(
     return { scene: { ...local, elements: [...byId.values()] }, changed };
 }
 
+/**
+ * Excalidraw 플러그인은 저장할 때 **id 가 8 자 넘는 텍스트·링크 요소를 무작위 8 자 id 로 바꾼다**
+ * (`findNewTextElementsInScene`, `^블록참조` 를 쓰려고). ExcaliDash 웹이 만드는 id 는 20 자라 전부 걸리고,
+ * 서버엔 원래 id 가 살아 있으니 당겨올 때마다 한 벌씩 더 생긴다(2026-09-23 `claude-text-1` 두 벌).
+ *
+ * 그래서 들어올 때 **결정론적으로** 8 자로 줄이고(같은 id 는 늘 같은 짧은 id), 나갈 때 되돌린다.
+ * 서버와 웹은 원래 id 를 그대로 본다.
+ */
+function shortElementId(id: string): string {
+    // ponytail: 53 비트 해시(cyrb53)에서 8 자, 도면당 수천 요소까지 충돌 무시 가능
+    let h1 = 0xdeadbeef;
+    let h2 = 0x41c6ce57;
+    for (let i = 0; i < id.length; i++) {
+        const c = id.charCodeAt(i);
+        h1 = Math.imul(h1 ^ c, 2654435761);
+        h2 = Math.imul(h2 ^ c, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36).padStart(8, "0").slice(-8);
+}
+
+/** 요소 id 와 그 id 를 가리키는 참조(컨테이너·바인딩·프레임)를 함께 바꾼다. */
+function remapElementIds(elements: readonly unknown[], map: Map<string, string>): unknown[] {
+    if (map.size === 0) return [...elements];
+    const re = (id: unknown) => (typeof id === "string" ? (map.get(id) ?? id) : id);
+    return elements.map((element) => {
+        if (!isRecord(element)) return element;
+        const out: Record<string, unknown> = { ...element, id: re(element.id) };
+        if ("containerId" in element) out.containerId = re(element.containerId);
+        if ("frameId" in element) out.frameId = re(element.frameId);
+        if (Array.isArray(element.boundElements)) {
+            out.boundElements = element.boundElements.map((b) =>
+                isRecord(b) ? { ...b, id: re(b.id) } : b,
+            );
+        }
+        for (const key of ["startBinding", "endBinding"]) {
+            const binding = element[key];
+            if (isRecord(binding)) out[key] = { ...binding, elementId: re(binding.elementId) };
+        }
+        return out;
+    });
+}
+
+/** 서버 → 로컬. 로컬에 원래 id 그대로 있는 요소는 건드리지 않는다(예전에 올린 것). */
+function toLocalIds(remote: readonly unknown[], localIds: ReadonlySet<string>): unknown[] {
+    const map = new Map<string, string>();
+    for (const element of remote) {
+        const id = elementId(element);
+        if (id !== null && id.length > 8 && !localIds.has(id)) map.set(id, shortElementId(id));
+    }
+    return remapElementIds(remote, map);
+}
+
+/** 로컬 → 서버. 짧은 id 중 서버 id 에서 나온 것만 원래대로 되돌린다. */
+function toRemoteIds(local: readonly unknown[], remoteIds: Iterable<string>): unknown[] {
+    const localIds = new Set(
+        local.map((element) => elementId(element)).filter((id): id is string => id !== null),
+    );
+    const map = new Map<string, string>();
+    for (const id of remoteIds) {
+        if (id.length <= 8 || localIds.has(id)) continue;
+        const short = shortElementId(id);
+        if (localIds.has(short)) map.set(short, id);
+    }
+    return remapElementIds(local, map);
+}
+
 function liveIdsOf(list: readonly unknown[]): Set<string> {
     return new Set(
         list
@@ -2265,6 +2601,7 @@ function liveIdsOf(list: readonly unknown[]): Set<string> {
 function withTombstones(
     scene: ExcalidrawScene,
     remoteElements: readonly unknown[],
+    knownIds?: ReadonlySet<string>,
 ): ExcalidrawScene {
     const elements = Array.isArray(scene.elements) ? scene.elements : [];
     const liveIds = new Set(
@@ -2277,7 +2614,8 @@ function withTombstones(
     const tombstones = remoteElements
         .filter((element) => {
             const id = elementId(element);
-            return id !== null && !liveIds.has(id);
+            // 본 적 없는 요소는 남이 방금 그린 것이다 — 우리가 지운 게 아니다.
+            return id !== null && !liveIds.has(id) && (knownIds === undefined || knownIds.has(id));
         })
         .map((element) => ({
             ...(element as Record<string, unknown>),
@@ -2355,21 +2693,6 @@ function rewriteTextElementsSection(raw: string, scene: ExcalidrawScene): string
     }
 
     return `${raw.slice(0, start)}## Text Elements\n${lines.join("\n\n")}\n\n${raw.slice(end)}`;
-}
-
-/**
- * Excalidraw 플러그인의 스크립팅 API. 열린 도면에 파일을 거치지 않고 넣기 위해 쓴다.
- * 전역으로 노출되고, 안 되면 플러그인 인스턴스에서 찾는다.
- */
-function getExcalidrawAutomate(app: App): Record<string, Function> | null {
-    const fromWindow = (window as unknown as { ExcalidrawAutomate?: unknown }).ExcalidrawAutomate;
-    if (isRecord(fromWindow)) return fromWindow as Record<string, Function>;
-    const plugin = (
-        app as unknown as {
-            plugins?: { plugins?: Record<string, { ea?: unknown }> };
-        }
-    ).plugins?.plugins?.["obsidian-excalidraw-plugin"];
-    return isRecord(plugin?.ea) ? (plugin.ea as Record<string, Function>) : null;
 }
 
 function remoteDrawingName(file: TFile): string {
