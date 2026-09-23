@@ -35,7 +35,7 @@ function methodBody(name) {
 const fail = [];
 
 // ① 동기화 경로는 도면 파일을 쓰면 안 된다
-for (const name of ["syncFile", "recordSync", "autoSyncFile", "queueAutoSync", "resolveDrawingState"]) {
+for (const name of ["syncFile", "recordSync", "autoSyncFile", "queueAutoSync", "resolveDrawingState", "pullIntoOpenView"]) {
     for (const [lineNo, text] of methodBody(name)) {
         if (WRITE_API.test(text)) {
             fail.push(`${name} 안에서 파일을 쓴다 — ${SOURCE}:${lineNo}  ${text.trim().slice(0, 70)}`);
@@ -79,9 +79,19 @@ for (let i = 0; i < lines.length; i++) {
 
 // ④ pull 은 도면이 열려 있으면 파일을 쓰면 안 된다 — 그 관문이 실제로 있는가
 {
-    const gate = methodBody("pullCurrentDrawing").map(([, t]) => t).join("\n");
-    if (!/isOpenInExcalidrawView\(/.test(gate)) {
-        fail.push("pullCurrentDrawing 에 열린-뷰 관문이 없다 — 열린 도면을 덮어쓰면 2026-09-23 사고가 재현된다");
+    for (const name of ["pullCurrentDrawing", "pullAllDrawings"]) {
+        const gate = methodBody(name).map(([, t]) => t).join("\n");
+        if (!/isOpenInExcalidrawView\(/.test(gate)) {
+            fail.push(`${name} 에 열린-뷰 분기가 없다 — 열린 도면에 파일을 쓰면 2026-09-23 사고가 재현된다`);
+        }
+        if (!/pullIntoOpenView\(/.test(gate)) {
+            fail.push(`${name} 이 열린 도면을 뷰 경로로 보내지 않는다`);
+        }
+    }
+    // 뷰 주입은 파일이 아니라 Excalidraw 의 API 로 해야 한다
+    const inject = methodBody("pullIntoOpenView").map(([, t]) => t).join("\n");
+    if (!/viewUpdateScene\(/.test(inject)) {
+        fail.push("pullIntoOpenView 가 viewUpdateScene 을 쓰지 않는다 — 그러면 뷰에 반영되지 않는다");
     }
     const guard = methodBody("isOpenInExcalidrawView").map(([, t]) => t).join("\n");
     if (!/getLeavesOfType\("excalidraw"\)/.test(guard)) {

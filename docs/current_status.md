@@ -1,14 +1,25 @@
 # excalidash-obsidian-live — 현재 상태
 
-> 최종 업데이트: 2026-09-23 (probe 2 종 통과 — 방 참가 ✅ · element-update 왕복 ✅. ▶ 다음 = 모바일 확인 + 배관 착수)
+> 최종 업데이트: 2026-09-23 (**양방향 동작** — push·pull·라이브러리 공유. 열린 뷰 주입까지. ▶ 다음 = socket.io 실시간)
 
 ## ▶ 다음 세션
 
-probe 가 끝났다. **실시간은 된다** — 설계 폴백은 필요 없다.
+**양방향이 닫혔다.** 사용자 실측: ExcaliDash 에서 그린 것이 Obsidian 에 들어오고, Obsidian 에서 그린 것이 ExcaliDash 로 나간다. 도면을 **열어둔 채로도** 반영된다.
 
-1. **모바일(아이패드) 에서 socket.io 가 되는가** — 남은 유일한 큰 미지수. 아이패드가 주 편집 기기다. Obsidian 의 `requestUrl` 은 HTTP 의 CORS 만 우회하고 WebSocket 은 별개다.
-2. `ExcalidrawAutomate` 접근 확인 — vault 에 zsviczian 플러그인이 깔린 상태에서 `ea.setView()` 가 잡히는가.
-3. 그 다음 배관. 순서는 `docs/todo.md` §2.
+1. **실시간(C)** — 남은 건 socket.io `element-update` 를 받아 `pullIntoOpenView` 를 부르는 것뿐이다. 프로토콜은 probe 로 증명했고(아래), 뷰 주입 경로도 뚫렸다.
+2. 텍스트 요소 **id 재발급** 확인 — 뷰 주입 뒤 id 가 바뀌는 것으로 보인다(Issue #8 남은 관찰). id 기준 병합의 전제라 실시간 전에 확인할 것.
+3. 모바일(아이패드)에서 socket.io 가 되는가 — 아직 미확인.
+4. 프로젝트별 도면 목록 노트 자동 생성(매핑 5·6번).
+
+## 지금 되는 것 (2026-09-23 실측)
+
+| | 상태 |
+|---|---|
+| Obsidian → ExcaliDash | ✅ 저장할 때 자동(2.5 초 디바운스) · 삭제는 tombstone 으로 전파 |
+| ExcaliDash → Obsidian | ✅ `Pull all drawings` · **도면이 열려 있으면 뷰에 직접 주입** |
+| 스텐실 라이브러리 | ✅ 양방향(249 항목). ⚠️ `/api/library` 는 API 키 범위 밖이라 **비밀번호 필요** |
+| 충돌 | ✅ 요소 단위 version 승 · 공통 조상 불필요 → 다자 편집 가능 |
+| 정본 | ExcaliDash. vault 파일은 클라이언트 사본 |
 
 ## Probe 결과 (2026-09-23) — 둘 다 통과
 

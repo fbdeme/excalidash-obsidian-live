@@ -104,3 +104,27 @@ Obsidian 의 Excalidraw 뷰에서 **빈 텍스트 박스를 만들고 저장하�
 
 ### 남은 위험
 **양방향(`bidirectional`) 모드의 `writeRemoteSceneToLocal` 은 여전히 도면 파일을 쓴다.** 지금은 단방향이라 닿지 않지만, 양방향을 켜면 같은 부류의 사고가 난다. 실시간(C) 설계에서 이 경로를 어떻게 다룰지 정해야 한다 — 열린 뷰가 있으면 `ExcalidrawAutomate` 로 넣고 파일은 건드리지 않는 쪽이 맞아 보인다.
+
+---
+
+## Issue #8: 파일을 부분만 고치면 도면이 망가진다 (오늘 사고 전체의 원인)
+**상태: ✅ 해결됨 (2026-09-23)**
+
+### 증상
+Obsidian 에서 빈 텍스트 박스를 만들고 저장하면 `## Text Elements` 구간이 통째로 그 요소 안에 들어갔다. 원인을 세 번 잘못 짚었다(우리 frontmatter 쓰기 → 우리 읽기 → LiveSync). **빈 no-op 플러그인으로도 재현**됐고 **새로 만든 도면은 멀쩡**해서, 원인이 플러그인이 아니라 **파일에 이미 박힌 불일치**임이 드러났다.
+
+### 원인
+`.excalidraw.md` 는 **압축 씬**과 **`## Text Elements`**(각 텍스트 요소를 `<텍스트> ^<id>` 로 풀어 적은 목록) 두 벌을 들고 있고, 플러그인은 파일을 읽을 때 **목록 쪽에서 텍스트를 가져온다.** 그래서 한쪽만 바꾸면 둘이 어긋나고, 그 파일은 열고 저장할 때마다 유령을 스스로 재생산한다.
+
+부분 수정을 한 주체가 그때그때 달랐을 뿐이다 — 서버에서 frontmatter 를 심은 것도, upstream 의 pull(`writeRemoteSceneToLocal` 이 씬 블록만 교체)도 같은 짓이었다.
+
+### 해결
+1. 파일을 쓸 때 `## Text Elements` 를 **씬에서 다시 생성**한다(`rewriteTextElementsSection`).
+2. 도면이 **열려 있으면 파일을 아예 안 쓰고** `ExcalidrawAutomate.viewUpdateScene()` 으로 살아 있는 뷰에 넣는다. 저장은 Excalidraw 플러그인이 하므로 두 쪽이 늘 일관된다.
+3. 정리 작업은 파일이 아니라 **ExcaliDash REST** 로 한다 — 도면을 열어둔 채로도 안전하다.
+
+### 검사
+`scripts/verify-text-elements-section.mjs`(재생성이 씬과 일치하는지 + 옛 방식이 어긋나는지) · `verify-no-drawing-writes.mjs`(pull 이 열린-뷰 분기를 갖는지, 뷰 주입이 파일을 안 쓰는지).
+
+### 남은 관찰
+뷰 주입 뒤 텍스트 요소의 **id 가 새로 매겨지는 것으로 보인다**(보낸 `claude-text-1` 이 `Y706lL3o`·`eM8rM5eU` 두 벌로 들어왔다). id 기준 병합이 텍스트 요소에서는 어긋날 수 있다 — 실시간(C) 전에 확인할 것.

@@ -161,6 +161,14 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         });
 
         this.addCommand({
+            id: "pull-all-drawings",
+            name: "Pull all drawings from ExcaliDash",
+            callback: () => {
+                void this.pullAllDrawings();
+            },
+        });
+
+        this.addCommand({
             id: "pull-current-drawing",
             name: "Pull current drawing from ExcaliDash",
             callback: () => {
@@ -302,6 +310,47 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             });
     }
 
+    /**
+     * opt-in 된 도면을 전부 당겨온다.
+     *
+     * 단일 파일 pull 은 **활성 파일**을 보는데, 열린 도면에는 쓰면 안 되므로(2026-09-23 사고)
+     * "열어두되 닫아라" 라는 모순이 된다. 그래서 활성 파일에 기대지 않는 이쪽이 기본이다.
+     */
+    async pullAllDrawings(): Promise<void> {
+        const results: SyncResult[] = [];
+
+        for (const file of this.app.vault.getMarkdownFiles()) {
+            if (!isExcalidrawFile(file)) continue;
+            const frontmatter = this.resolveDrawingState(
+                file,
+                parseDrawingFrontmatter(
+                    this.app.metadataCache.getFileCache(file)?.frontmatter,
+                ),
+            );
+            if (frontmatter.destination === undefined || frontmatter.id === undefined) continue;
+            const target = this.settings.targets.find(
+                (item) => item.name === frontmatter.destination,
+            );
+            if (target === undefined) continue;
+
+            // 열려 있으면 파일을 쓰지 않고 살아 있는 뷰에 직접 넣는다.
+            results.push(
+                this.isOpenInExcalidrawView(file)
+                    ? await this.pullIntoOpenView(file, target, frontmatter)
+                    : await this.pullFile(file, target, frontmatter),
+            );
+        }
+
+        if (results.length === 0) {
+            new Notice(
+                "ExcaliDash Live: no opted-in drawings with a recorded remote yet — push one first.",
+                8000,
+            );
+            return;
+        }
+        this.showSyncSummary(results);
+    }
+
     async pullCurrentDrawing(): Promise<void> {
         const file = this.app.workspace.getActiveFile();
         if (file === null || !isExcalidrawFile(file)) {
@@ -324,13 +373,65 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             new Notice("ExcaliDash Live: no remote drawing recorded yet — push once first.");
             return;
         }
-        // v1 은 열려 있으면 거부한다. 열린 뷰에 직접 주입(ExcalidrawAutomate)은 다음 단계.
-        if (this.isOpenInExcalidrawView(file)) {
-            new Notice("ExcaliDash Live: close the drawing first, then pull.");
-            return;
+        this.showSyncSummary([
+            this.isOpenInExcalidrawView(file)
+                ? await this.pullIntoOpenView(file, target, frontmatter)
+                : await this.pullFile(file, target, frontmatter),
+        ]);
+    }
+
+    /**
+     * 열려 있는 도면에 **파일을 거치지 않고** 반영한다.
+     *
+     * 파일을 부분만 고치면 압축 씬과 `## Text Elements` 가 어긋나 도면이 망가진다(2026-09-23).
+     * 살아 있는 뷰에 넣으면 저장은 Excalidraw 플러그인이 하므로 두 쪽이 늘 일관된다.
+     */
+    async pullIntoOpenView(
+        file: TFile,
+        target: ExcaliDashTarget,
+        frontmatter: DrawingFrontmatter,
+    ): Promise<SyncResult> {
+        const ea = getExcalidrawAutomate(this.app);
+        const leaf = this.app.workspace
+            .getLeavesOfType("excalidraw")
+            .find((item) => {
+                const state = item.getViewState().state as { file?: unknown } | undefined;
+                return state?.file === file.path;
+            });
+        if (ea === null || leaf === undefined) {
+            return {
+                path: file.path,
+                status: "error",
+                message: "Excalidraw scripting API unavailable — close the drawing and pull again.",
+            };
         }
 
-        this.showSyncSummary([await this.pullFile(file, target, frontmatter)]);
+        try {
+            ea.reset();
+            if (ea.setView(leaf.view) === null) {
+                return { path: file.path, status: "error", message: "Could not attach to the open view." };
+            }
+            const current = ea.getViewElements() as unknown[];
+            const remote = await getRemoteDrawing(target, frontmatter.id as string);
+            const { scene, changed } = mergeScenes(
+                { elements: [...current], appState: {}, files: {} },
+                remote.elements ?? [],
+            );
+            if (changed === 0) {
+                await this.recordSync(file, remote.id, remote.version, frontmatter.lastHash ?? "");
+                return { path: file.path, status: "skipped", message: "Already up to date." };
+            }
+            ea.viewUpdateScene({ elements: scene.elements, commitToHistory: true });
+            await this.recordSync(file, remote.id, remote.version, await sceneHash(scene));
+            return {
+                path: file.path,
+                status: "synced",
+                message: `Pulled ${changed} element(s) into the open drawing (version ${remote.version}).`,
+            };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { path: file.path, status: "error", message };
+        }
     }
 
     async pullFile(
@@ -370,6 +471,17 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             new Notice("ExcaliDash Live: configure a target first.");
             return;
         }
+        // /api/library 는 API 키 범위(drawings·collections) 밖이라 **로그인이 필요하다**(실측: API 키는 403).
+        // 비밀번호 없이 부르면 엉뚱한 에러가 나므로 먼저 막고 무엇이 필요한지 말해 준다.
+        if (target.password.trim().length === 0) {
+            new Notice(
+                "ExcaliDash Live: the stencil library needs your ExcaliDash password " +
+                    "(the API key has no access to /api/library). Enter it in settings.",
+                10000,
+            );
+            return;
+        }
+
         try {
             const session = await loginWithPassword(target);
             const remote = await requestUrl({
@@ -378,6 +490,18 @@ export default class ExcaliDashSyncPlugin extends Plugin {
                 headers: { Accept: "application/json", Cookie: session.cookieHeader },
                 throw: false,
             });
+            if (remote.status === 403) {
+                new Notice(
+                    "ExcaliDash Live: ExcaliDash refused the library request (403). " +
+                        "Check that the account can reach /api/library.",
+                    10000,
+                );
+                return;
+            }
+            if (remote.status >= 400) {
+                new Notice(`ExcaliDash Live: library fetch failed (${remote.status}).`, 8000);
+                return;
+            }
             const remoteItems: unknown[] = Array.isArray(remote.json?.items) ? remote.json.items : [];
 
             const path = excalidrawLibraryPath(this.app);
@@ -474,7 +598,7 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             if (frontmatter.id === undefined) {
                 const created = await createRemoteDrawing(
                     target,
-                    file.basename,
+                    remoteDrawingName(file),
                     parsed.scene,
                     collectionId,
                 );
@@ -496,8 +620,14 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             const remoteChanged =
                 frontmatter.version !== undefined &&
                 remote.version !== frontmatter.version;
+            // frontmatter 에 collection 이 **없으면 원격의 컬렉션을 그대로 둔다.**
+            // 예전엔 없으면 null 로 보고 컬렉션에서 빼버렸는데, "지정 안 함" 은 "빼라" 가 아니다.
+            const targetCollectionId =
+                frontmatter.collection === undefined
+                    ? (remote.collectionId ?? null)
+                    : collectionId;
             const collectionChanged =
-                (remote.collectionId ?? null) !== collectionId;
+                (remote.collectionId ?? null) !== targetCollectionId;
 
             if (
                 frontmatter.direction === "bidirectional" &&
@@ -545,10 +675,10 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             const updated = await updateRemoteDrawing(
                 target,
                 frontmatter.id,
-                file.basename,
+                remoteDrawingName(file),
                 outgoing,
                 remote.version,
-                collectionId,
+                targetCollectionId,
             );
 
             // 기록을 먼저 남긴다. 검증에서 걸리더라도 서버는 이미 올라갔으므로, 여기서 빠져나가면
@@ -643,10 +773,13 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             parsed.sourceFormat === "compressed-json"
                 ? compressToBase64(JSON.stringify(sceneDocument))
                 : JSON.stringify(sceneDocument, null, 2);
-        const nextContent =
+        const withScene =
             parsed.jsonStart === 0 && parsed.jsonEnd === raw.length
                 ? replacement
                 : `${raw.slice(0, parsed.jsonStart)}${replacement}${raw.slice(parsed.jsonEnd)}`;
+
+        // 씬만 바꾸고 텍스트 목록을 두면 둘이 어긋나 도면이 망가진다.
+        const nextContent = rewriteTextElementsSection(withScene, sceneDocument as ExcalidrawScene);
 
         await this.app.vault.process(file, () => nextContent);
     }
@@ -669,7 +802,12 @@ export default class ExcaliDashSyncPlugin extends Plugin {
         const details = [...conflicts, ...errors]
             .map((item) => `${item.path}: ${item.message}`)
             .join("\n");
-        const summary = `ExcaliDash Live: ${synced} synced, ${skipped} skipped, ${conflicts.length} conflicts, ${errors.length} errors.`;
+        // 0 인 항목은 말하지 않는다. "0 conflicts, 0 errors" 를 붙이면 성공이 실패처럼 읽힌다.
+        const parts = [`${synced} synced`];
+        if (skipped > 0) parts.push(`${skipped} unchanged`);
+        if (conflicts.length > 0) parts.push(`${conflicts.length} conflicts`);
+        if (errors.length > 0) parts.push(`${errors.length} failed`);
+        const summary = `ExcaliDash Live: ${parts.join(", ")}.`;
         new Notice(
             details.length > 0 ? `${summary}\n${details}` : summary,
             details.length > 0 ? 12000 : 5000,
@@ -698,11 +836,15 @@ export default class ExcaliDashSyncPlugin extends Plugin {
             }
         }
 
-        const summary = `ExcaliDash Live: updated ${updated} drawings in ${folder.path}. ${errors.length} errors.`;
-        new Notice(
-            errors.length > 0 ? `${summary}\n${errors.join("\n")}` : summary,
-            errors.length > 0 ? 12000 : 5000,
-        );
+        // 에러가 0 건인데도 "0 errors" 를 붙이면 성공을 실패로 읽는다(실측: 사용자가 그렇게 읽었다).
+        // 0 건은 성공처럼 보이면 안 된다 — 폴더를 잘못 고른 경우가 대부분이다(실측).
+        const summary =
+            errors.length > 0
+                ? `ExcaliDash Live: updated ${updated} drawings in ${folder.path}, ${errors.length} failed.\n${errors.join("\n")}`
+                : updated === 0
+                  ? `ExcaliDash Live: no Excalidraw drawings found in ${folder.path} — nothing was changed. Check the folder.`
+                  : `ExcaliDash Live: updated ${updated} drawings in ${folder.path}.`;
+        new Notice(summary, errors.length > 0 || updated === 0 ? 12000 : 5000);
     }
 }
 
@@ -2187,6 +2329,51 @@ function excalidrawLibraryPath(app: App): string {
             ? settings.libraryFileName
             : "local-library";
     return `${folder}/${name}.excalidrawlib`;
+}
+
+/** 원격 드로잉 이름. `foo.excalidraw.md` 의 basename 은 `foo.excalidraw` 라 꼬리를 뗀다. */
+/**
+ * `## Text Elements` 구간을 씬에서 다시 만든다.
+ *
+ * Excalidraw 플러그인은 도면의 글자를 이 구간에 `<텍스트> ^<요소 id>` 로 풀어 적고(검색·링크용),
+ * 파일을 읽을 때 **여기서 텍스트를 가져온다**. 그래서 씬 블록만 바꾸고 이 구간을 두면 둘이 어긋나
+ * 엉뚱한 요소에 엉뚱한 글자가 들어간다 — 2026-09-23 에 도면 두 개가 이렇게 망가졌다.
+ */
+function rewriteTextElementsSection(raw: string, scene: ExcalidrawScene): string {
+    const start = raw.indexOf("## Text Elements");
+    if (start < 0) return raw;
+    const after = raw.indexOf("\n## ", start + 1);
+    const end = after < 0 ? raw.length : after + 1;
+
+    const lines: string[] = [];
+    for (const element of scene.elements ?? []) {
+        if (!isRecord(element) || element.type !== "text" || element.isDeleted === true) continue;
+        const id = elementId(element);
+        const text = typeof element.text === "string" ? element.text : "";
+        if (id === null || text.length === 0) continue;
+        lines.push(`${text} ^${id}`);
+    }
+
+    return `${raw.slice(0, start)}## Text Elements\n${lines.join("\n\n")}\n\n${raw.slice(end)}`;
+}
+
+/**
+ * Excalidraw 플러그인의 스크립팅 API. 열린 도면에 파일을 거치지 않고 넣기 위해 쓴다.
+ * 전역으로 노출되고, 안 되면 플러그인 인스턴스에서 찾는다.
+ */
+function getExcalidrawAutomate(app: App): Record<string, Function> | null {
+    const fromWindow = (window as unknown as { ExcalidrawAutomate?: unknown }).ExcalidrawAutomate;
+    if (isRecord(fromWindow)) return fromWindow as Record<string, Function>;
+    const plugin = (
+        app as unknown as {
+            plugins?: { plugins?: Record<string, { ea?: unknown }> };
+        }
+    ).plugins?.plugins?.["obsidian-excalidraw-plugin"];
+    return isRecord(plugin?.ea) ? (plugin.ea as Record<string, Function>) : null;
+}
+
+function remoteDrawingName(file: TFile): string {
+    return file.basename.replace(/\.excalidraw$/i, "");
 }
 
 function isExcalidrawFile(file: TFile): boolean {
